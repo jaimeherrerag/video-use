@@ -52,7 +52,7 @@ SUB_FORCE_STYLE = (
     "FontName=Helvetica,FontSize=18,Bold=1,"
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
     "BorderStyle=1,Outline=2,Shadow=0,"
-    "Alignment=2,MarginV=90"
+    "Alignment=2,MarginV=20"
 )
 
 # -------- Helpers ------------------------------------------------------------
@@ -146,7 +146,89 @@ def is_portrait_source(video: Path) -> bool:
         return False
 
 
+# -------- Codec de video (x264 CPU por default, NVENC GPU con --nvenc) -------
+
+
+def nvenc_available() -> bool:
+    """True si este ffmpeg trae el encoder h264_nvenc (GPU NVIDIA + drivers)."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, check=True,
+        )
+    except Exception:
+        return False
+    return "h264_nvenc" in out.stdout
+
+
+def video_codec_args(
+    *, nvenc: bool, draft: bool = False, preview: bool = False, high_quality: bool = False
+) -> list[str]:
+    """Bloque de códec de video para los encodes de segmento.
+
+    El entregable final es quality-first: x264 slow/crf17 sigue siendo mejor
+    calidad-por-bit que NVENC a bitrate bajo → sigue siendo el default de
+    --high-quality y del render sin flags.
+
+    NVENC usa **H.264**, no HEVC (medido 2026-08-04: mismo s/clip y mismo tamaño
+    que hevc_nvenc, pero H.264 evita dos fallos silenciosos de HEVC):
+      - Chrome headless NO decodifica HEVC → un base HEVC embebido en una
+        composición HyperFrames sale NEGRO sin warning. `--preview` genera
+        `base_preview.mp4`, que es justo el archivo que se copia a
+        `slot_hf/assets/base.mp4`.
+      - `-ss` no busca bien en HEVC → extraer fragmentos de un preview para
+        re-transcribir devuelve audio basura/alucinado.
+    `-cq` controla calidad (menor = mejor); `-b:v 0` deja a CQ como único driver.
+    CQ 1-2 puntos por debajo del equivalente HEVC: H.264 es menos eficiente.
+    """
+    if nvenc:
+        if draft:
+            nv_preset, cq = "p2", "30"
+        elif preview:
+            nv_preset, cq = "p5", "25"
+        elif high_quality:
+            nv_preset, cq = "p7", "18"
+        else:
+            nv_preset, cq = "p6", "20"
+        return [
+            "-c:v", "h264_nvenc", "-preset", nv_preset, "-tune", "hq",
+            "-rc", "vbr", "-cq", cq, "-b:v", "0", "-pix_fmt", "yuv420p",
+        ]
+    # x264 (CPU) — quality ladder
+    if draft:
+        preset, crf = "ultrafast", "28"
+    elif preview:
+        preset, crf = "medium", "22"
+    elif high_quality:
+        preset, crf = "slow", "17"
+    else:
+        preset, crf = "fast", "20"
+    return ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p"]
+
+
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
+
+
+def censor_chain(regions: list) -> str:
+    """Blur rectangular regions (source-pixel coords) via split/crop/boxblur/overlay.
+
+    Returns a filtergraph fragment with one unlabeled input and output, safe to
+    embed in a -vf chain or after [0:v] in a filter_complex. Regions are blurred
+    hard enough to make on-screen text (IPs, keys) unreadable.
+    """
+    parts = []
+    for i, r in enumerate(regions):
+        x, y, w, h = int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"])
+        parts.append(
+            f"split[cb{i}][cr{i}];"
+            f"[cr{i}]crop={w}:{h}:{x}:{y},"
+            # radius capped at half the region size (boxblur hard limit); power 3
+            # keeps small text unreadable even with a small radius
+            f"boxblur=luma_radius=min(min(w\\,h)/2-1\\,12):luma_power=3:"
+            f"chroma_radius=min(min(cw\\,ch)/2-1\\,6):chroma_power=3[cx{i}];"
+            f"[cb{i}][cx{i}]overlay={x}:{y}"
+        )
+    return ",".join(parts)
 
 
 def extract_segment(
@@ -157,6 +239,12 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    reframe: dict | None = None,
+    fps: int = 24,
+    high_quality: bool = False,
+    nvenc: bool = False,
+    audio_filter: str | None = None,
+    censor: list | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -167,44 +255,138 @@ def extract_segment(
       - final (default): 1080p libx264 fast CRF 20
       - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
       - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
+
+    Optional `reframe` dict (e.g. for 16:9 → 9:16 shorts):
+      {
+        "src_crop": { "x": int, "y": int, "w": int, "h": int },  # window in source pixels
+        "out_size": { "w": 1080, "h": 1920 },                   # target output size
+        "fit":      "blur-bg",                                  # only mode for now
+        "blur_sigma": 20                                        # optional
+      }
+    When set, the filter graph splits the input into a blureado full-frame
+    background and a cropped/scaled foreground centered vertically.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    portrait = is_portrait_source(source)
-    if draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
-    else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+    vcodec = video_codec_args(
+        nvenc=nvenc, draft=draft, preview=preview, high_quality=high_quality
+    )
 
-    vf_parts: list[str] = []
-    if is_hdr_source(source):
-        vf_parts.append(TONEMAP_CHAIN)
-    vf_parts.append(scale)
-    if grade_filter:
-        vf_parts.append(grade_filter)
-    vf = ",".join(vf_parts)
-
-    # 30ms audio fades at both edges (Rule 3) — prevent pops
+    # 30ms audio fades at both edges (Rule 3) — prevent pops.
+    # `apad` + `-shortest` (below) trim audio to EXACTLY the frame-quantized video
+    # duration so per-segment A/V durations match. Without this, video (discrete
+    # frames) and audio (exact samples) drift a few ms/segment, accumulating into
+    # progressive audio desync across a long concat. See CLAUDE.md.
     fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03,apad"
+    # Filtro de audio opcional (ej. denoise) ANTES de fades/apad, en la etapa PCM.
+    # OJO: afftdn aquí junto a un -filter_complex de video (reframe) deadlockea
+    # ffmpeg 8.0.1 — para EDLs con reframe, denoisear el source completo en un
+    # pase (source_dn.mov) en vez de usar este campo. Ver CLAUDE.md.
+    if audio_filter:
+        af = f"{audio_filter},{af}"
 
-    if draft:
-        preset, crf = "ultrafast", "28"
-    elif preview:
-        preset, crf = "medium", "22"
-    else:
-        preset, crf = "fast", "20"
+    # Accurate input seek (`-ss` before `-i`, with ffmpeg's default accurate_seek):
+    # seeks to the keyframe, decodes, and discards up to seg_start so BOTH audio
+    # and video begin exactly at seg_start. Do NOT combine with an output `-ss`
+    # (hybrid seek): the input seek lands on a keyframe before seg_start and the
+    # output `-ss` then measures from there, starting the content early and
+    # clipping speech off the END of every segment. Render at the source's native
+    # fps (`--fps 60`) to avoid frame-decimation lip-sync artifacts. See CLAUDE.md.
+    if reframe is None:
+        # Legacy path: simple scale + grade, no reframe.
+        portrait = is_portrait_source(source)
+        if draft:
+            scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+        else:
+            scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+
+        vf_parts: list[str] = []
+        # Censor regions use SOURCE-pixel coords: apply before any scale.
+        if censor:
+            vf_parts.append(censor_chain(censor))
+        if is_hdr_source(source):
+            vf_parts.append(TONEMAP_CHAIN)
+        vf_parts.append(scale)
+        if grade_filter:
+            vf_parts.append(grade_filter)
+        vf = ",".join(vf_parts)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{seg_start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-vf", vf,
+            "-af", af,
+            *vcodec, "-r", str(fps),
+            # PCM lossless: el único encode AAC ocurre al final (loudnorm). Ver FINAL_AAC_BITRATE.
+            "-c:a", "pcm_s16le", "-ar", "48000",
+            "-shortest",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return
+
+    # ----- Reframe path: blur-bg (9:16 shorts) or crop-scale (16:9 top-crop) -----
+    fit = reframe.get("fit", "blur-bg")
+    if fit not in ("blur-bg", "crop-scale", "crop-pad"):
+        raise ValueError(f"unsupported reframe.fit: {fit}")
+
+    src_crop = reframe["src_crop"]
+    cx = int(src_crop["x"]); cy = int(src_crop["y"])
+    cw = int(src_crop["w"]); ch = int(src_crop["h"])
+    out_size = reframe.get("out_size", {"w": 1080, "h": 1920})
+    out_w = int(out_size["w"]); out_h = int(out_size["h"])
+
+    # Optional HDR tonemap applied before split so both layers are SDR.
+    prelude = TONEMAP_CHAIN + "," if is_hdr_source(source) else ""
+    # Censor regions (source-pixel coords) go first, before crop/scale.
+    if censor:
+        prelude = censor_chain(censor) + "," + prelude
+    grade_suffix = f",{grade_filter}" if grade_filter else ""
+
+    if fit == "crop-scale":
+        # Crop source window and scale to fill output. Minor geometric distortion accepted.
+        fc = (
+            f"[0:v]{prelude}crop={cw}:{ch}:{cx}:{cy},"
+            f"scale={out_w}:{out_h}:flags=lanczos{grade_suffix}[outv]"
+        )
+    elif fit == "crop-pad":
+        # Crop source window and center it on a black canvas — no zoom, no stretch.
+        # (e.g. hide browser chrome: crop y=115..1080 and letterbox 57/58px top/bottom)
+        fc = (
+            f"[0:v]{prelude}crop={cw}:{ch}:{cx}:{cy},"
+            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black{grade_suffix}[outv]"
+        )
+    else:  # blur-bg
+        blur_sigma = int(reframe.get("blur_sigma", 20))
+        fg_y_offset = int(reframe.get("fg_y_offset_px", 0))
+        # Background: scale full source to cover output, gaussian blur.
+        # Foreground: crop window, scale to output width, overlay vertically centered.
+        y_expr = "(H-h)/2" if fg_y_offset == 0 else f"(H-h)/2{fg_y_offset:+d}"
+        fc = (
+            f"[0:v]{prelude}split=2[fg_src][bg_src];"
+            f"[bg_src]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+            f"crop={out_w}:{out_h},gblur=sigma={blur_sigma}[bg];"
+            f"[fg_src]crop={cw}:{ch}:{cx}:{cy},scale={out_w}:-2{grade_suffix}[fg];"
+            f"[bg][fg]overlay=x=0:y={y_expr}:format=auto[outv]"
+        )
 
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
         "-t", f"{duration:.3f}",
-        "-vf", vf,
+        "-filter_complex", fc,
+        "-map", "[outv]",
+        "-map", "0:a",
         "-af", af,
-        "-c:v", "libx264", "-preset", preset, "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "24",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        *vcodec, "-r", str(fps),
+        # PCM lossless: el único encode AAC ocurre al final (loudnorm). Ver FINAL_AAC_BITRATE.
+        "-c:a", "pcm_s16le", "-ar", "48000",
+        "-shortest",
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -216,6 +398,9 @@ def extract_all_segments(
     edit_dir: Path,
     preview: bool,
     draft: bool = False,
+    fps: int = 24,
+    high_quality: bool = False,
+    nvenc: bool = False,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -233,11 +418,14 @@ def extract_all_segments(
 
     ranges = edl["ranges"]
     sources = edl["sources"]
+    audio_filter = edl.get("audio_filter")
 
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
     if is_auto:
         print("  (auto-grade per segment: analyzing each range)")
+    if audio_filter:
+        print(f"  audio_filter: {audio_filter}")
     for i, r in enumerate(ranges):
         src_name = r["source"]
         src_path = resolve_path(sources[src_name], edit_dir)
@@ -252,10 +440,17 @@ def extract_all_segments(
             seg_filter = resolved
 
         note = r.get("beat") or r.get("note") or ""
-        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
+        reframe = r.get("reframe")
+        rf_tag = f"  reframe={reframe['fit']}" if reframe else ""
+        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}{rf_tag}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        extract_segment(
+            src_path, start, duration, seg_filter, out_path,
+            preview=preview, draft=draft, reframe=reframe,
+            fps=fps, high_quality=high_quality, nvenc=nvenc,
+            audio_filter=audio_filter, censor=r.get("censor"),
+        )
         seg_paths.append(out_path)
 
     return seg_paths
@@ -295,6 +490,31 @@ def _srt_timestamp(seconds: float) -> str:
     m, rem = divmod(rem, 60_000)
     s, ms = divmod(rem, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _srt_parse(ts: str) -> float:
+    h, m, rest = ts.split(":")
+    s, ms = rest.split(",")
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+
+def scale_srt(src: Path, dst: Path, speed: float) -> None:
+    """Reescala un SRT al timeline acelerado (tiempos / speed).
+
+    El SRT que se QUEMA va en el timeline del composite — se acelera junto al
+    video, así que queda sincronizado solo. Este archivo aparte es para uso
+    externo (subir subtítulos a YouTube), donde el timeline es el del entregable.
+    """
+    out: list[str] = []
+    for line in src.read_text().splitlines():
+        m = re.match(r"^(\d\d:\d\d:\d\d,\d\d\d) --> (\d\d:\d\d:\d\d,\d\d\d)\s*$", line)
+        if m:
+            out.append(f"{_srt_timestamp(_srt_parse(m.group(1)) / speed)} --> "
+                       f"{_srt_timestamp(_srt_parse(m.group(2)) / speed)}")
+        else:
+            out.append(line)
+    dst.write_text("\n".join(out))
+    print(f"SRT reescalado a {speed:g}x → {dst.name} (para subir aparte)")
 
 
 def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict]:
@@ -393,6 +613,13 @@ LOUDNORM_I = -14.0
 LOUDNORM_TP = -1.0
 LOUDNORM_LRA = 11.0
 
+# Audio del entregable final. Los clips intermedios se guardan en PCM (lossless)
+# para que solo exista UN encode AAC en todo el pipeline (el de aquí). Encodear
+# AAC dos veces a 192k (clips + loudnorm) producía ruido de cuantización audible
+# en agudos correlacionado con el habla ("estática al hablar"). 256k en una sola
+# generación deja el residuo ~45 dB abajo (inaudible). Ver CLAUDE.md.
+FINAL_AAC_BITRATE = "256k"
+
 
 def measure_loudness(video_path: Path) -> dict[str, str] | None:
     """Run ffmpeg loudnorm first pass and parse the JSON measurement.
@@ -449,7 +676,7 @@ def apply_loudnorm_two_pass(
             "-i", str(input_path),
             "-c:v", "copy",
             "-af", filter_str,
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-c:a", "aac", "-b:a", FINAL_AAC_BITRATE, "-ar", "48000",
             "-movflags", "+faststart",
             str(output_path),
         ]
@@ -481,7 +708,7 @@ def apply_loudnorm_two_pass(
         "-i", str(input_path),
         "-c:v", "copy",
         "-af", filter_str,
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-c:a", "aac", "-b:a", FINAL_AAC_BITRATE, "-ar", "48000",
         "-movflags", "+faststart",
         str(output_path),
     ]
@@ -499,17 +726,56 @@ def build_final_composite(
     subtitles_path: Path | None,
     out_path: Path,
     edit_dir: Path,
+    encode_audio: bool = False,
+    nvenc: bool = False,
+    speed: float = 1.0,
 ) -> None:
-    """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
+    """Final pass: base → overlays (PTS-shifted) → subtitles LAST → speed → out.
 
     If there are no overlays and no subtitles, just copy base to out.
+
+    El audio de base.mp4 viene en PCM (lossless). Si esta salida es terminal
+    (encode_audio=True, p.ej. --no-loudnorm) hay que codear AAC aquí, que es el
+    único encode lossy. Si es intermedia (antes de loudnorm) se copia el PCM
+    para que loudnorm haga el único encode AAC. Ver FINAL_AAC_BITRATE.
+
+    `speed` (aceleración global) se aplica al FINAL de la cadena, después de
+    overlays y subtítulos: así todo se acelera coherentemente y no hay que
+    reescalar ningún timestamp. Va antes del loudnorm, que mide el audio ya
+    acelerado.
     """
     has_overlays = bool(overlays)
     has_subs = subtitles_path is not None and subtitles_path.exists()
+    apply_speed = abs(speed - 1.0) > 1e-6
+
+    # Con speed el audio pasa por atempo y deja de poder copiarse; se reescribe
+    # en PCM (lossless) para no gastar la única generación AAC del pipeline.
+    if encode_audio:
+        audio_args = ["-c:a", "aac", "-b:a", FINAL_AAC_BITRATE, "-ar", "48000"]
+    elif apply_speed:
+        audio_args = ["-c:a", "pcm_s16le"]
+    else:
+        audio_args = ["-c:a", "copy"]
+
+    # Composite re-encodea video. x264 fast/crf18 por default; H.264 NVENC con --nvenc.
+    vcodec = (
+        ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
+         "-rc", "vbr", "-cq", "19", "-b:v", "0", "-pix_fmt", "yuv420p"]
+        if nvenc else
+        ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]
+    )
 
     if not has_overlays and not has_subs:
-        # Nothing to do — just rename/copy base to final name
-        run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
+        if apply_speed:
+            # Nada que componer pero sí que acelerar → re-encode mínimo
+            run(["ffmpeg", "-y", "-i", str(base_path),
+                 "-filter_complex",
+                 f"[0:v]setpts=PTS/{speed:.6f}[outv];[0:a]atempo={speed:.6f}[outa]",
+                 "-map", "[outv]", "-map", "[outa]", *vcodec, *audio_args,
+                 "-movflags", "+faststart", str(out_path)], quiet=True)
+        else:
+            # Nada que componer — copiar video y (re)encodear audio según destino
+            run(["ffmpeg", "-y", "-i", str(base_path), "-c:v", "copy", *audio_args, str(out_path)], quiet=True)
         return
 
     inputs: list[str] = ["-i", str(base_path)]
@@ -518,10 +784,26 @@ def build_final_composite(
         inputs += ["-i", str(ov_path)]
 
     filter_parts: list[str] = []
-    # PTS-shift every overlay so its frame 0 lands at start_in_output
+    # PTS-shift every overlay so its frame 0 lands at start_in_output.
+    # Three modes:
+    #   colorkey present → green-screen key then composite
+    #   .webm (no colorkey) → VP9 dual-stream alpha: stream:0=RGB, stream:1=alpha mask
+    #   other (MOV/MP4, no colorkey) → native yuva420p alpha channel
     for idx, ov in enumerate(overlays, start=1):
         t = float(ov["start_in_output"])
-        filter_parts.append(f"[{idx}:v]setpts=PTS-STARTPTS+{t}/TB[a{idx}]")
+        ck = ov.get("colorkey")
+        ov_path = resolve_path(ov["file"], edit_dir)
+        is_webm = ov_path.suffix.lower() == ".webm"
+        if ck:
+            filter_parts.append(f"[{idx}:v]colorkey={ck},format=yuva420p,setpts=PTS-STARTPTS+{t}/TB[a{idx}]")
+        elif is_webm:
+            # VP9 alpha stores RGB and alpha as two separate video streams in the WebM container.
+            # stream:0 = color, stream:1 = alpha (grayscale). Merge them before overlaying.
+            filter_parts.append(f"[{idx}:v:0]setpts=PTS-STARTPTS+{t}/TB[ov_rgb{idx}]")
+            filter_parts.append(f"[{idx}:v:1]setpts=PTS-STARTPTS+{t}/TB[ov_a{idx}]")
+            filter_parts.append(f"[ov_rgb{idx}][ov_a{idx}]alphamerge[a{idx}]")
+        else:
+            filter_parts.append(f"[{idx}:v]format=yuva420p,setpts=PTS-STARTPTS+{t}/TB[a{idx}]")
 
     # Chain overlays on top of base
     current = "[0:v]"
@@ -537,7 +819,11 @@ def build_final_composite(
 
     # Subtitles LAST — Rule 1
     if has_subs:
-        subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
+        subs_abs = (str(subtitles_path.resolve())
+                    .replace("\\", "/")
+                    .replace(":", r"\:")
+                    .replace(" ", r"\ ")
+                    .replace("'", r"\'"))
         filter_parts.append(
             f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
         )
@@ -550,6 +836,15 @@ def build_final_composite(
         else:
             out_label = "[0:v]"
 
+    # Speed al final de todo: los subtítulos ya quemados se aceleran junto al
+    # video, así que siguen sincronizados sin tocar el SRT.
+    amap = "0:a"
+    if apply_speed:
+        filter_parts.append(f"{out_label}setpts=PTS/{speed:.6f}[outv_s]")
+        out_label = "[outv_s]"
+        filter_parts.append(f"[0:a]atempo={speed:.6f}[outa]")
+        amap = "[outa]"
+
     filter_complex = ";".join(filter_parts)
 
     cmd = [
@@ -557,15 +852,15 @@ def build_final_composite(
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
-        "-map", "0:a",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
+        "-map", amap,
+        *vcodec,
+        *audio_args,
         "-movflags", "+faststart",
         str(out_path),
     ]
     print(f"compositing → {out_path.name}")
-    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
+    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}"
+          + (f", speed: {speed:g}x" if apply_speed else ""))
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -579,7 +874,8 @@ def main() -> None:
     ap.add_argument(
         "--preview",
         action="store_true",
-        help="Preview mode: 1080p, medium, CRF 22 — evaluable for QC, faster than final.",
+        help="Preview mode: 1080p evaluable para QC. Usa H.264 NVENC si hay GPU "
+             "(si no, x264 medium CRF 22).",
     )
     ap.add_argument(
         "--draft",
@@ -601,7 +897,61 @@ def main() -> None:
         action="store_true",
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
     )
+    ap.add_argument(
+        "--fps",
+        type=int,
+        default=24,
+        help="Output framerate. Default 24. Use 60 to preserve 60fps source.",
+    )
+    ap.add_argument(
+        "--high-quality",
+        action="store_true",
+        help="Final-render high quality (preset slow, CRF 17). Ignored if --preview/--draft.",
+    )
+    ap.add_argument(
+        "--nvenc",
+        action="store_true",
+        help="Encode con GPU NVIDIA (H.264 NVENC) en vez de x264. ~2.5x más rápido para "
+             "ITERAR; a bitrate generoso es transparente para YouTube. Implícito en "
+             "--preview (usa --x264 para desactivarlo). Para el entregable final de "
+             "máxima calidad-por-bit usa x264 (sin este flag) + --high-quality.",
+    )
+    ap.add_argument(
+        "--x264",
+        action="store_true",
+        help="Fuerza encode por CPU aunque haya GPU. Desactiva el NVENC implícito de "
+             "--preview.",
+    )
+    ap.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="Aceleración global del entregable (video setpts + audio atempo). "
+             "Default 1.0 (sin cambio). El canal usa 1.08. Se aplica al final, "
+             "después de overlays y subtítulos, así que nada se desincroniza. "
+             "OJO: en el flujo con stitch (liquid glass por tramos) el speed va "
+             "en el stitch, no aquí.",
+    )
     args = ap.parse_args()
+
+    if args.nvenc and args.x264:
+        sys.exit("--nvenc y --x264 son mutuamente excluyentes.")
+    if not (0.5 <= args.speed <= 2.0):
+        sys.exit("--speed fuera de rango: atempo admite 0.5-2.0 en una pasada.")
+    if args.speed > 1.15:
+        print(f"  aviso: speed {args.speed:g}x es alto; por encima de ~1.10 la "
+              f"aceleración se nota en tramos densos.")
+    if args.nvenc and not nvenc_available():
+        sys.exit("--nvenc pedido pero este ffmpeg no expone h264_nvenc. "
+                 "Verifica GPU/drivers NVIDIA y que ffmpeg esté compilado con NVENC "
+                 "(`ffmpeg -hide_banner -encoders | findstr nvenc`).")
+
+    # --preview implica NVENC: el preview es para ITERAR, y H.264 por GPU cuesta
+    # ~2.5x menos sin perder resolución (medido: 5m43s vs 14m21s en 279 clips).
+    # Fallback silencioso a x264 si la máquina no tiene GPU.
+    if args.preview and not args.nvenc and not args.x264 and nvenc_available():
+        args.nvenc = True
+        print("  preview: usando H.264 NVENC (GPU). --x264 para forzar CPU.")
 
     edl_path = args.edl.resolve()
     if not edl_path.exists():
@@ -613,7 +963,8 @@ def main() -> None:
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft
+        edl, edit_dir, preview=args.preview, draft=args.draft,
+        fps=args.fps, high_quality=args.high_quality, nvenc=args.nvenc,
     )
 
     # 2. Concat → base
@@ -637,16 +988,21 @@ def main() -> None:
             if not subs_path.exists():
                 print(f"warning: subtitles path in EDL does not exist: {subs_path}")
                 subs_path = None
+    if subs_path and abs(args.speed - 1.0) > 1e-6:
+        scale_srt(subs_path, subs_path.with_name(f"{subs_path.stem}_speed.srt"), args.speed)
 
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
     if args.no_loudnorm:
-        # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        # Composite directly to final output → salida terminal, encodear AAC aquí
+        # (base.mp4 trae PCM; sin loudnorm este es el único encode lossy).
+        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir,
+                              encode_audio=True, nvenc=args.nvenc, speed=args.speed)
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir,
+                              nvenc=args.nvenc, speed=args.speed)
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)
