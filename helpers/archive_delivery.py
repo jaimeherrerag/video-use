@@ -3,7 +3,8 @@
 Hace tres cosas que Jaime venia haciendo a mano despues de cada entrega:
 
   1. Renombra el entregable a un slug con palabras clave (para el algoritmo).
-  2. Crea `Videos/youtube/<N> (DD-MM-YY)/` con el siguiente numero de video.
+  2. Crea `<raiz>/youtube/<N> (DD-MM-YY)/` con el siguiente numero de video.
+     La raiz es D:/Footage (o ~/Videos en maquinas viejas) — ver resolve_videos_root.
   3. Mueve ahi el entregable Y los archivos crudos (.mkv + .mp4 de OBS).
 
 Ademas reescribe las rutas de `sources` en el EDL para que el proyecto siga
@@ -20,26 +21,48 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
 from datetime import date, datetime
 from pathlib import Path
 
-VIDEOS = Path.home() / "Videos"
-YT = VIDEOS / "youtube"
+# Raiz del archivo de videos: la carpeta que contiene "youtube/<N> (DD-MM-YY)/".
+# En la PC vieja era ~/Videos; desde la migracion de PC (2026-09) vive en D:\Footage
+# porque C: es un SSD chico y los crudos pesan 4-6 GB por video.
+# Orden de resolucion: --videos-root > $VIDEO_ARCHIVE_ROOT > primer candidato que exista.
+VIDEOS_CANDIDATES = [Path("D:/Footage"), Path.home() / "Videos"]
+
+
+def resolve_videos_root(cli_root: str | None) -> Path:
+    """Devuelve la raiz que contiene youtube/, o aborta con un mensaje util."""
+    for label, raw in (("--videos-root", cli_root),
+                       ("$VIDEO_ARCHIVE_ROOT", os.environ.get("VIDEO_ARCHIVE_ROOT"))):
+        if raw:
+            root = Path(raw).expanduser()
+            if not (root / "youtube").is_dir():
+                sys.exit(f"{label}={root} pero no existe {root / 'youtube'}")
+            return root
+    for cand in VIDEOS_CANDIDATES:
+        if (cand / "youtube").is_dir():
+            return cand
+    probed = ", ".join(str(c) for c in VIDEOS_CANDIDATES)
+    sys.exit(f"no encontre la raiz del archivo de videos (probe: {probed}). "
+             f"Pasa --videos-root <ruta> o exporta VIDEO_ARCHIVE_ROOT.")
+
 # carpetas tipo "43 (15-08-26)"; el año va en 2 digitos (el 4-digitos de la 37 es un desliz)
 FOLDER_RE = re.compile(r"^(\d+)\s*\((\d{2}-\d{2}-\d{2,4})\)$")
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 
 
-def next_number() -> int:
-    if not YT.is_dir():
-        sys.exit(f"no existe {YT}")
-    nums = [int(m.group(1)) for d in YT.iterdir() if d.is_dir()
+def next_number(yt: Path) -> int:
+    if not yt.is_dir():
+        sys.exit(f"no existe {yt}")
+    nums = [int(m.group(1)) for d in yt.iterdir() if d.is_dir()
             for m in [FOLDER_RE.match(d.name)] if m]
     if not nums:
-        sys.exit(f"no encontre carpetas con formato '<N> (DD-MM-YY)' en {YT}")
+        sys.exit(f"no encontre carpetas con formato '<N> (DD-MM-YY)' en {yt}")
     return max(nums) + 1
 
 
@@ -54,7 +77,7 @@ def raw_siblings(src: Path) -> list[Path]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Archiva un entregable en Videos/youtube/")
+    ap = argparse.ArgumentParser(description="Archiva un entregable en <raiz>/youtube/")
     ap.add_argument("--edit-dir", type=Path, required=True)
     ap.add_argument("--slug", type=str, required=True,
                     help="nombre con palabras clave, snake_case (ej. deepseek_harness_gratis)")
@@ -64,8 +87,15 @@ def main() -> None:
                     help="DD-MM-YY (default: la fecha de modificacion del entregable, "
                          "que es cuando realmente se termino — no 'hoy')")
     ap.add_argument("--number", type=int, default=None, help="fuerza el numero de video")
+    ap.add_argument("--videos-root", type=str, default=None,
+                    help="carpeta que contiene youtube/ (default: D:/Footage o ~/Videos, "
+                         "lo que exista; tambien se puede fijar con $VIDEO_ARCHIVE_ROOT)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+
+    videos = resolve_videos_root(args.videos_root)
+    yt = videos / "youtube"
+    print(f"archivo de videos: {yt}")
 
     if not SLUG_RE.match(args.slug):
         sys.exit(f"slug invalido: {args.slug!r} (usa minusculas y guiones bajos)")
@@ -96,17 +126,17 @@ def main() -> None:
             # solo se archivan las fuentes que viven en Videos/ (los derivados
             # tipo source_mixed.mov se quedan en el proyecto)
             try:
-                src.relative_to(VIDEOS)
+                src.relative_to(videos)
             except ValueError:
                 continue
             for f in raw_siblings(src):
                 if f not in raws:
                     raws.append(f)
 
-    n = args.number or next_number()
+    n = args.number or next_number(yt)
     # la fecha de finalizacion es la del render, no la del dia en que se archiva
     d = args.date or datetime.fromtimestamp(final.stat().st_mtime).strftime("%d-%m-%y")
-    dest = YT / f"{n} ({d})"
+    dest = yt / f"{n} ({d})"
     new_final = dest / f"{args.slug}{final.suffix}"
 
     print(f"destino: {dest}")

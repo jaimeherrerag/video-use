@@ -170,6 +170,10 @@ def video_codec_args(
     calidad-por-bit que NVENC a bitrate bajo → sigue siendo el default de
     --high-quality y del render sin flags.
 
+    Desde la PC nueva (2026-09) x264 además es MÁS RÁPIDO que NVENC: la GPU es
+    la misma RTX 3060 y la CPU se multiplicó por ~5, así que el ladder de x264
+    gana en velocidad y en calidad. Ver la nota en main().
+
     NVENC usa **H.264**, no HEVC (medido 2026-08-04: mismo s/clip y mismo tamaño
     que hevc_nvenc, pero H.264 evita dos fallos silenciosos de HEVC):
       - Chrome headless NO decodifica HEVC → un base HEVC embebido en una
@@ -280,9 +284,11 @@ def extract_segment(
     fade_out_start = max(0.0, duration - 0.03)
     af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03,apad"
     # Filtro de audio opcional (ej. denoise) ANTES de fades/apad, en la etapa PCM.
-    # OJO: afftdn aquí junto a un -filter_complex de video (reframe) deadlockea
-    # ffmpeg 8.0.1 — para EDLs con reframe, denoisear el source completo en un
-    # pase (source_dn.mov) en vez de usar este campo. Ver CLAUDE.md.
+    # (Histórico: afftdn aquí junto a un -filter_complex de video (reframe)
+    # deadlockeaba ffmpeg 8.0.1. RESUELTO en ffmpeg 9.0.1 — re-verificado
+    # 2026-09-03 con x264 y con NVENC. Ver CLAUDE.md. Denoisear el source
+    # completo en un pase (source_dn.mov) sigue siendo preferible por dar un
+    # perfil de ruido consistente, pero ya no es obligatorio con reframe.)
     if audio_filter:
         af = f"{audio_filter},{af}"
 
@@ -911,16 +917,17 @@ def main() -> None:
     ap.add_argument(
         "--nvenc",
         action="store_true",
-        help="Encode con GPU NVIDIA (H.264 NVENC) en vez de x264. ~2.5x más rápido para "
-             "ITERAR; a bitrate generoso es transparente para YouTube. Implícito en "
-             "--preview (usa --x264 para desactivarlo). Para el entregable final de "
-             "máxima calidad-por-bit usa x264 (sin este flag) + --high-quality.",
+        help="Encode con GPU NVIDIA (H.264 NVENC) en vez de x264. OJO: en esta "
+             "máquina (Ryzen 7 7700 + RTX 3060) NVENC es MÁS LENTO que x264 y de "
+             "peor calidad — medido 1.14 s/clip vs 0.80 s/clip. Úsalo solo para "
+             "liberar la CPU mientras renderizas otra cosa. Ya NO es implícito en "
+             "--preview. Re-medir si cambia la GPU.",
     )
     ap.add_argument(
         "--x264",
         action="store_true",
-        help="Fuerza encode por CPU aunque haya GPU. Desactiva el NVENC implícito de "
-             "--preview.",
+        help="Fuerza encode por CPU. Ya es el default en todas las calidades; "
+             "el flag se mantiene por compatibilidad con scripts viejos.",
     )
     ap.add_argument(
         "--speed",
@@ -946,12 +953,15 @@ def main() -> None:
                  "Verifica GPU/drivers NVIDIA y que ffmpeg esté compilado con NVENC "
                  "(`ffmpeg -hide_banner -encoders | findstr nvenc`).")
 
-    # --preview implica NVENC: el preview es para ITERAR, y H.264 por GPU cuesta
-    # ~2.5x menos sin perder resolución (medido: 5m43s vs 14m21s en 279 clips).
-    # Fallback silencioso a x264 si la máquina no tiene GPU.
-    if args.preview and not args.nvenc and not args.x264 and nvenc_available():
-        args.nvenc = True
-        print("  preview: usando H.264 NVENC (GPU). --x264 para forzar CPU.")
+    # NOTA (2026-09, PC nueva con Ryzen 7 7700): --preview YA NO implica NVENC.
+    # La CPU se volvio ~4-5x mas rapida y la GPU es la misma RTX 3060, asi que
+    # x264 gana en las dos dimensiones. Medido sobre clips de 3.2s a 1080p60:
+    #   x264 medium/crf22 (preview)  0.80 s/clip
+    #   x264 slow/crf17   (final)    1.08 s/clip
+    #   NVENC p5/cq25     (preview)  1.14 s/clip   <- mas lento Y peor calidad
+    #   NVENC p7/cq18                1.34 s/clip
+    # NVENC solo conviene si la CPU esta ocupada con otra cosa; queda como opt-in
+    # explicito con --nvenc. Re-medir si cambia la GPU (una RTX 40/50 lo invierte).
 
     edl_path = args.edl.resolve()
     if not edl_path.exists():
