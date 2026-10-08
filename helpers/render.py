@@ -360,11 +360,18 @@ def extract_segment(
             f"scale={out_w}:{out_h}:flags=lanczos{grade_suffix}[outv]"
         )
     elif fit == "crop-pad":
-        # Crop source window and center it on a black canvas — no zoom, no stretch.
+        # Crop source window and center it on a black canvas — never zoom IN, no stretch.
         # (e.g. hide browser chrome: crop y=115..1080 and letterbox 57/58px top/bottom)
+        # Con fuente 4K hay que REDUCIR (solo reducir) para que quepa en out_size: sin
+        # esto el pad recibe 3840 px de ancho y falla. En draft la caja baja a 2/3,
+        # igual que el legacy path (1280), para que el concat de segmentos cuadre.
+        bw, bh = out_w, out_h
+        if draft:
+            bw, bh = int(out_w * 2 / 3) // 2 * 2, int(out_h * 2 / 3) // 2 * 2
         fc = (
             f"[0:v]{prelude}crop={cw}:{ch}:{cx}:{cy},"
-            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black{grade_suffix}[outv]"
+            f"scale=w='trunc(iw*min(1,min({bw}/iw,{bh}/ih))/2)*2':h=-2:flags=lanczos,"
+            f"pad={bw}:{bh}:(ow-iw)/2:(oh-ih)/2:black{grade_suffix}[outv]"
         )
     else:  # blur-bg
         blur_sigma = int(reframe.get("blur_sigma", 20))
@@ -387,7 +394,10 @@ def extract_segment(
         "-t", f"{duration:.3f}",
         "-filter_complex", fc,
         "-map", "[outv]",
-        "-map", "0:a",
+        # Solo la pista del mic, igual que el legacy path (ffmpeg elige 0:a:0 por default).
+        # "0:a" metia TODAS las pistas: con OBS mic+escritorio el segmento salia con dos
+        # streams de audio y no cuadraba en el concat con los segmentos sin reframe.
+        "-map", "0:a:0",
         "-af", af,
         *vcodec, "-r", str(fps),
         # PCM lossless: el único encode AAC ocurre al final (loudnorm). Ver FINAL_AAC_BITRATE.
