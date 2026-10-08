@@ -75,6 +75,49 @@ def pico_s(path: Path) -> float:
     return float(rms.argmax() * w / 8000)
 
 
+def cargar_partes(spec: dict, base: Path, verbose: bool = False) -> list[tuple[Path, Path, float]]:
+    """(video, audio base, duracion). La duracion es la del VIDEO del base PCM."""
+    parts = []
+    for p in spec["parts"]:
+        v, a = (base / p["video"]).resolve(), (base / p["audio"]).resolve()
+        d, dv = dur(a, "v:0"), dur(v, "v:0")
+        if dv + 0.02 < d:
+            sys.exit(f"{v.name} dura {dv:.3f}s y su base {d:.3f}s: el video quedaria corto")
+        parts.append((v, a, d))
+        if verbose:
+            print(f"  parte {v.name}: {d:.3f}s (video fuente {dv:.3f}s)")
+    return parts
+
+
+def cadena_voz(parts, speed: float) -> tuple[list[str], list[str], int]:
+    """Inputs y filtergraph que dejan la voz concatenada y acelerada en [voz]."""
+    inputs, fc = [], []
+    for k, (_, a, d) in enumerate(parts):
+        inputs += ["-i", str(a)]
+        fc.append(f"[{k}:a:0]atrim=0:{d:.3f},asetpts=PTS-STARTPTS,aresample=48000[p{k}]")
+    n = len(parts)
+    fc.append("".join(f"[p{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1"
+              + (f",atempo={speed:g}" if abs(speed - 1) > 1e-6 else "") + "[voz]")
+    return inputs, fc, n
+
+
+def medir_ganancia(parts, speed: float, ln: dict) -> float:
+    """dB que el loudnorm final le sumara a ESTA voz (se mide, no se asume).
+
+    En 2026-08 fue +2.5 dB y en el video del 2026-10-07 +4.99 dB: con un valor fijo la
+    musica quedo 2 dB arriba del objetivo. La musica y los SFX casi no mueven la
+    integrada, asi que basta medir la voz sola. mezcla_studio.py usa la misma funcion.
+    """
+    inputs, fc, _ = cadena_voz(parts, speed)
+    err = run(["ffmpeg", "-hide_banner", "-nostats", *inputs, "-filter_complex",
+               ";".join(fc) + f";[voz]loudnorm=I={ln['I']}:TP={ln['TP']}:LRA={ln['LRA']}:"
+               "print_format=json[o]", "-map", "[o]", "-f", "null", "-"])
+    mv = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
+    g = ln["I"] - float(mv["input_i"])
+    print(f"  voz sola: {mv['input_i']} LUFS -> el loudnorm la sube {g:+.2f} dB")
+    return g
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Stitch final: partes + speed + musica + SFX + loudnorm")
     ap.add_argument("spec", type=Path)
@@ -89,42 +132,17 @@ def main() -> int:
     ln = spec.get("loudnorm", {"I": -14, "TP": -1, "LRA": 11})
 
     # --- 1. partes: duracion = la del VIDEO del base PCM (la cola de HF se descarta)
-    parts = []
-    for p in spec["parts"]:
-        v, a = (base / p["video"]).resolve(), (base / p["audio"]).resolve()
-        d = dur(a, "v:0")
-        dv = dur(v, "v:0")
-        if dv + 0.02 < d:
-            sys.exit(f"{v.name} dura {dv:.3f}s y su base {d:.3f}s: el video quedaria corto")
-        parts.append((v, a, d))
-        print(f"  parte {v.name}: {d:.3f}s (video fuente {dv:.3f}s)")
+    parts = cargar_partes(spec, base, verbose=True)
     total = sum(d for _, _, d in parts)
     print(f"  total {total:.3f}s -> con speed {speed:g}: {total / speed:.3f}s")
 
     # --- 2. mezcla de audio (PCM): voz acelerada + musica + SFX ------------------------
     mix = out.with_name(out.stem + "_mix.wav")
-    inputs, fc, k = [], [], 0
-    for _, a, d in parts:
-        inputs += ["-i", str(a)]
-        fc.append(f"[{k}:a:0]atrim=0:{d:.3f},asetpts=PTS-STARTPTS,aresample=48000[p{k}]")
-        k += 1
-    n_parts = k
-    voz = "".join(f"[p{i}]" for i in range(n_parts))
-    fc.append(f"{voz}concat=n={n_parts}:v=0:a=1"
-              + (f",atempo={speed:g}" if abs(speed - 1) > 1e-6 else "") + "[voz]")
+    inputs, fc, k = cadena_voz(parts, speed)
     capas = ["[voz]"]
-
-    # Ganancia REAL que el loudnorm le dara a esta voz. No se asume: en 2026-08 fue +2.5 dB
-    # y en el video del 2026-10-07 +4.9 dB (la musica quedo 2 dB arriba del objetivo).
-    # La musica a ~-41 dB casi no mueve la integrada, asi que se mide con la voz sola.
     ganancia = 0.0
     if spec.get("music") or spec.get("sfx"):
-        err = run(["ffmpeg", "-hide_banner", "-nostats", *inputs, "-filter_complex",
-                   ";".join(fc) + f";[voz]loudnorm=I={ln['I']}:TP={ln['TP']}:LRA={ln['LRA']}:"
-                   "print_format=json[o]", "-map", "[o]", "-f", "null", "-"])
-        mv = json.loads(err[err.rindex("{"): err.rindex("}") + 1])
-        ganancia = ln["I"] - float(mv["input_i"])
-        print(f"  voz sola: {mv['input_i']} LUFS -> el loudnorm la sube {ganancia:+.2f} dB")
+        ganancia = medir_ganancia(parts, speed, ln)
 
     for m in spec.get("music", []):
         f = (base / m["file"]).resolve()
