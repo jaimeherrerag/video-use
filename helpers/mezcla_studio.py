@@ -46,22 +46,10 @@ def fmt(t: float) -> str:
     return f"{int(m):02d}:{s:04.1f}"
 
 
-def to_studio(spec_path: Path) -> None:
-    base = spec_path.parent
-    spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    speed = float(spec.get("speed", 1.0))
-    ln = spec.get("loudnorm", {"I": -14, "TP": -1, "LRA": 11})
-    edit = base.parent
-    out = edit / "mezcla"
-    assets = out / "assets"
-    proxy = assets / "mezcla_proxy.mp4"
-    if not proxy.exists():
-        sys.exit(f"falta el proxy {proxy} (ver docstring)")
-
-    parts = cargar_partes(spec, base)
-    total = sum(d for _, _, d in parts)
-    g = medir_ganancia(parts, speed, ln)
-
+def clips_audio(spec: dict, base: Path, assets: Path, g: float, speed: float,
+                track0: int = 2) -> tuple[list[str], dict]:
+    """<audio> de musica y SFX (volumen relativo a la voz = 1) + el mapa para leerlos de vuelta.
+    Lo usan este CLI y studio_maestro.py (regla de oro: la mezcla se ve y se edita en Studio)."""
     clips, mapa = [], {"ganancia": g, "speed": speed, "music": [], "sfx": []}
     for i, m in enumerate(spec.get("music", [])):
         f = (base / m["file"]).resolve()
@@ -84,7 +72,7 @@ def to_studio(spec_path: Path) -> None:
             f'    <audio id="{cid}" src="assets/{escape(f.name)}" data-audio-group="musica"\n'
             f'      data-timeline-label="Música {i + 1} · {escape(f.stem[:30])} ({fmt(m["t"])})"\n'
             f'      data-start="{m["t"]:.3f}" data-duration="{d:.3f}" data-media-start="{m.get("src", 0):.3f}"\n'
-            f'      data-volume="{vol:.4f}" data-track-index="{2 + i}"\n'
+            f'      data-volume="{vol:.4f}" data-track-index="{track0 + i}"\n'
             f"      data-fx-chain='{fx}'\n      data-automation='{auto}'></audio>")
         mapa["music"].append({"id": cid, "mean": mean, "ini": {"start": round(m["t"], 3), "dur": d,
                               "ms": round(m.get("src", 0), 3), "vol": round(vol, 4)}})
@@ -104,9 +92,30 @@ def to_studio(spec_path: Path) -> None:
             f'    <audio id="{cid}" src="assets/{escape(f.name)}" data-audio-group="sfx"\n'
             f'      data-timeline-label="SFX {i + 1} · {escape(f.stem)} ({fmt(s["t"])})"\n'
             f'      data-start="{start:.3f}" data-duration="{dur(f, "a:0"):.3f}"\n'
-            f'      data-volume="{min(vol, 3.98):.4f}" data-track-index="{4 + i % 2}"></audio>')
+            f'      data-volume="{min(vol, 3.98):.4f}" data-track-index="{track0 + 2 + i % 2}"></audio>')
         mapa["sfx"].append({"id": cid, "peak": peak, "off": off,
                             "ini": {"start": round(start, 3), "vol": round(min(vol, 3.98), 4)}})
+
+    return clips, mapa
+
+
+def to_studio(spec_path: Path) -> None:
+    base = spec_path.parent
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    speed = float(spec.get("speed", 1.0))
+    ln = spec.get("loudnorm", {"I": -14, "TP": -1, "LRA": 11})
+    edit = base.parent
+    out = edit / "mezcla"
+    assets = out / "assets"
+    proxy = assets / "mezcla_proxy.mp4"
+    if not proxy.exists():
+        sys.exit(f"falta el proxy {proxy} (ver docstring)")
+
+    parts = cargar_partes(spec, base)
+    total = sum(d for _, _, d in parts)
+    g = medir_ganancia(parts, speed, ln)
+
+    clips, mapa = clips_audio(spec, base, assets, g, speed)
 
     html = f"""<!doctype html>
 <html lang="es">
@@ -161,15 +170,10 @@ class Audios(HTMLParser):
             self.a[d["id"]] = d
 
 
-def from_studio(spec_path: Path) -> None:
-    base = spec_path.parent
-    out = base.parent / "mezcla"
-    spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    mapa = json.loads((out / "mezcla_map.json").read_text(encoding="utf-8"))
-    p = Audios()
-    p.feed((out / "index.html").read_text(encoding="utf-8"))
+def leer_audio(spec: dict, mapa: dict, audios: dict, vref: float = 1.0) -> tuple[list, list, list[str]]:
+    """De los <audio> que dejo Studio a music/sfx del stitch.json. Solo aplica lo que se
+    movio respecto del valor inicial (mapa[...]["ini"]); devuelve tambien el reporte."""
     g, speed = mapa["ganancia"], mapa["speed"]
-    vref = float(p.a.get("voz", {}).get("data-volume", 1) or 1)
 
     def oculto(a: dict) -> bool:
         return "data-hidden" in a and a.get("data-hidden") not in ("false", "0")
@@ -180,7 +184,7 @@ def from_studio(spec_path: Path) -> None:
 
     cambios, music, sfx = [], [], []
     for m, info in zip(spec.get("music", []), mapa["music"]):
-        a = p.a.get(info["id"])
+        a = audios.get(info["id"])
         if a is None or oculto(a):
             cambios.append(f"  {info['id']}: ELIMINADA")
             continue
@@ -199,7 +203,7 @@ def from_studio(spec_path: Path) -> None:
                 cambios.append(f"  {info['id']}: {k} {m.get(k)} -> {nuevo[k]}")
         music.append(nuevo)
     for s, info in zip(spec.get("sfx", []), mapa["sfx"]):
-        a = p.a.get(info["id"])
+        a = audios.get(info["id"])
         if a is None or oculto(a):
             cambios.append(f"  {info['id']} ({Path(s['file']).stem}): ELIMINADO")
             continue
@@ -215,6 +219,19 @@ def from_studio(spec_path: Path) -> None:
         sfx.append(nuevo)
     if abs(vref - 1) > 1e-3:
         cambios.insert(0, f"  voz a {vref:.2f} en Studio: musica y SFX se leen RELATIVOS a la voz")
+    return music, sfx, cambios
+
+
+def from_studio(spec_path: Path) -> None:
+    base = spec_path.parent
+    out = base.parent / "mezcla"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    mapa = json.loads((out / "mezcla_map.json").read_text(encoding="utf-8"))
+    p = Audios()
+    p.feed((out / "index.html").read_text(encoding="utf-8"))
+    vref = float(p.a.get("voz", {}).get("data-volume", 1) or 1)
+
+    music, sfx, cambios = leer_audio(spec, mapa, p.a, vref)
 
     print("\n".join(cambios) if cambios else "  sin cambios en la mezcla")
     if cambios:

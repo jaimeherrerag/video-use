@@ -337,7 +337,7 @@ def extract_segment(
 
     # ----- Reframe path: blur-bg (9:16 shorts) or crop-scale (16:9 top-crop) -----
     fit = reframe.get("fit", "blur-bg")
-    if fit not in ("blur-bg", "crop-scale", "crop-pad"):
+    if fit not in ("blur-bg", "crop-scale", "crop-pad", "place"):
         raise ValueError(f"unsupported reframe.fit: {fit}")
 
     src_crop = reframe["src_crop"]
@@ -372,6 +372,21 @@ def extract_segment(
             f"[0:v]{prelude}crop={cw}:{ch}:{cx}:{cy},"
             f"scale=w='trunc(iw*min(1,min({bw}/iw,{bh}/ih))/2)*2':h=-2:flags=lanczos,"
             f"pad={bw}:{bh}:(ow-iw)/2:(oh-ih)/2:black{grade_suffix}[outv]"
+        )
+    elif fit == "place":
+        # Caso general que sale de Studio (geometria_studio.py): la zona src_crop de la
+        # fuente se escala al rect `dst` del output y el resto es negro. crop-pad y
+        # crop-scale son casos particulares. Es lo que Jaime ve al mover/escalar un clip.
+        d = reframe["dst"]
+        k = 2 / 3 if draft else 1.0                 # draft: misma caja reducida que el legacy
+        bw, bh = int(out_w * k) // 2 * 2, int(out_h * k) // 2 * 2
+        dx, dy = int(d["x"] * k), int(d["y"] * k)
+        dw, dh = max(2, int(d["w"] * k) // 2 * 2), max(2, int(d["h"] * k) // 2 * 2)
+        dw, dh = min(dw, bw - dx), min(dh, bh - dy)
+        fc = (
+            f"[0:v]{prelude}crop={cw}:{ch}:{cx}:{cy},"
+            f"scale={dw}:{dh}:flags=lanczos,"
+            f"pad={bw}:{bh}:{dx}:{dy}:black{grade_suffix}[outv]"
         )
     else:  # blur-bg
         blur_sigma = int(reframe.get("blur_sigma", 20))
