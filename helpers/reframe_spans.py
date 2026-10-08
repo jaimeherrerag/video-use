@@ -37,6 +37,7 @@ import numpy as np
 
 UMBRAL = 12.0        # diferencia media (0-255, gris) para considerar el parche "igual"
 PIEZA_MIN = 0.20     # al partir un range, piezas mas cortas se absorben en la vecina
+BUSCAR_SILENCIO = 1.5  # s que un borde se puede mover para caer en silencio
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +128,42 @@ def cmd_apply(args) -> int:
     reframe = {"src_crop": {"x": 0, "y": args.crop_top, "w": src_w, "h": src_h - args.crop_top},
                "out_size": {"w": out_w, "h": out_h}, "fit": "crop-pad"}
 
-    def dentro(t: float) -> bool:
-        return any(a <= t < b for a, b in spans)
+    def fraccion_dentro(a: float, b: float) -> float:
+        tot = sum(max(0.0, min(b, y) - max(a, x)) for x, y in spans)
+        return tot / max(b - a, 1e-6)
 
-    nuevos, n_ref, n_split = [], 0, 0
+    # Partir un range a mitad de habla deja un hueco audible: render.py pone un fade de
+    # 30 ms en cada borde de segmento. Con mapa de energia, cada borde se mueve al
+    # silencio mas cercano (<= BUSCAR_SILENCIO s); si no hay, el range no se parte.
+    db = np.load(args.energia) if args.energia else None
+    step, voz_db = 0.05, -38.0
+
+    def a_silencio(x: float, s: float, e: float) -> float | None:
+        if db is None:
+            return x
+        i0 = int(x / step)
+        if db[max(0, i0 - 1):i0 + 2].max() <= voz_db:
+            return x                                  # ya cae en silencio
+        rng = int(BUSCAR_SILENCIO / step)
+        for d in range(1, rng + 1):                   # el mas cercano, hacia ambos lados
+            for i in (i0 - d, i0 + d):
+                t = i * step
+                if s + 0.3 < t < e - 0.3 and db[i - 1:i + 2].max() <= voz_db:
+                    return round(t, 3)
+        return None
+
+    nuevos, n_ref, n_split, n_movidos, n_sin_partir = [], 0, 0, 0, 0
     for r in edl["ranges"]:
         s, e = float(r["start"]), float(r["end"])
-        cortes = sorted({s, e, *[x for a, b in spans for x in (a, b) if s < x < e]})
+        internos = []
+        for x in sorted(x for a, b in spans for x in (a, b) if s < x < e):
+            y = a_silencio(x, s, e)
+            if y is None:
+                n_sin_partir += 1
+                continue
+            n_movidos += y != x
+            internos.append(y)
+        cortes = sorted({s, e, *internos})
         piezas = [[a, b] for a, b in zip(cortes, cortes[1:])]
         # absorber piezas minimas en la vecina (no vale la pena un corte de 3 frames)
         k = 0
@@ -151,7 +181,7 @@ def cmd_apply(args) -> int:
             q = dict(r)
             q["start"], q["end"] = round(a, 3), round(b, 3)
             q.pop("reframe", None)
-            if dentro((a + b) / 2):
+            if fraccion_dentro(a, b) >= 0.5:
                 q["reframe"] = reframe
                 n_ref += 1
             nuevos.append(q)
@@ -162,7 +192,8 @@ def cmd_apply(args) -> int:
     edl["ranges"] = nuevos
     edl_path.write_text(json.dumps(edl, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"{n_ref} de {len(nuevos)} ranges con reframe (crop-top {args.crop_top}) | "
-          f"{n_split} ranges partidos en un borde de ventana -> {edl_path}")
+          f"{n_split} ranges partidos en un borde de ventana ({n_movidos} bordes movidos a "
+          f"silencio, {n_sin_partir} sin silencio cerca: no se parten) -> {edl_path}")
     return 0
 
 
@@ -181,6 +212,8 @@ def main() -> int:
     a.add_argument("--crop-top", type=int, required=True, help="px del source a quitar arriba")
     a.add_argument("--src-size", default="3840x2160")
     a.add_argument("--out-size", default="1920x1080")
+    a.add_argument("--energia", help="edit/verify/<stem>.energy.npy de verify_edl: mueve los bordes "
+                                     "a silencio para no partir una palabra")
     args = ap.parse_args()
     return cmd_detect(args) if args.cmd == "detect" else cmd_apply(args)
 
