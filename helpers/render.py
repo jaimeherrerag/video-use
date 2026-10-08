@@ -949,8 +949,16 @@ def main() -> None:
              "OJO: en el flujo con stitch (liquid glass por tramos) el speed va "
              "en el stitch, no aquí.",
     )
+    ap.add_argument(
+        "--pcm",
+        action="store_true",
+        help="Salida INTERMEDIA para el stitch: overlays compuestos, audio PCM, sin "
+             "loudnorm ni speed (eso lo hace stitch_final.py una sola vez al final).",
+    )
     args = ap.parse_args()
 
+    if args.pcm and abs(args.speed - 1.0) > 1e-6:
+        sys.exit("--pcm es una salida intermedia: el --speed va en stitch_final.py, no aquí.")
     if args.nvenc and args.x264:
         sys.exit("--nvenc y --x264 son mutuamente excluyentes.")
     if not (0.5 <= args.speed <= 2.0):
@@ -1013,7 +1021,11 @@ def main() -> None:
 
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
-    if args.no_loudnorm:
+    if args.pcm:
+        # Intermedio para stitch_final.py: PCM, sin loudnorm (una sola generación AAC al final)
+        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir,
+                              encode_audio=False, nvenc=args.nvenc, speed=1.0)
+    elif args.no_loudnorm:
         # Composite directly to final output → salida terminal, encodear AAC aquí
         # (base.mp4 trae PCM; sin loudnorm este es el único encode lossy).
         build_final_composite(base_path, overlays, subs_path, out_path, edit_dir,

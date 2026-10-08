@@ -106,6 +106,70 @@ def group_into_pills(
     return out_pills
 
 
+SALIDA_PILL = 0.30   # duracion del tween de salida de la pill en el template (y -30, 0.30 s)
+
+
+def corregir_encimados(pills: list[dict]) -> int:
+    """La pill i debe terminar su salida antes de que entre la i+1 (mismo lugar en pantalla).
+
+    Antes hide_at = fin de la ultima word + 0.35 sin mirar la siguiente: con cortes por
+    max_per_pill o por puntuacion la siguiente entraba ~0.1 s despues y se veian dos
+    pills encimadas (`check` lo reporta como content_overlap). Se respeta un minimo de
+    0.25 s con la ultima word encendida.
+    """
+    n = 0
+    for a, b in zip(pills, pills[1:]):
+        tope = b["show_at"] - SALIDA_PILL
+        if a["hide_at"] > tope:
+            minimo = a["words"][-1]["at"] + 0.25
+            a["hide_at"] = round(max(minimo, tope), 3)
+            n += 1
+    return n
+
+
+def _norm(t: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFD", t.lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9ñ]", "", t)
+
+
+def pills_de_frases(transcript_path: Path, ranges: list[tuple[float, float]], frases: list[str],
+                    max_per_pill: int) -> tuple[list[dict], float, list[str]]:
+    """Pills SOLO para frases clave (subtitulos selectivos, p.ej. una intro).
+
+    Mapea todas las words del EDL al timeline de salida y busca cada frase como
+    secuencia de tokens normalizados (sin acentos ni puntuacion). Una frase de mas de
+    `max_per_pill` palabras se parte en varias pills. Devuelve las frases no encontradas.
+    """
+    words, off = [], 0.0
+    for s, e in ranges:
+        for w in load_words_in_range(transcript_path, s, e):
+            words.append({"text": w["text"], "at": w["start"] - s + off,
+                          "end": w["end"] - s + off, "tok": _norm(w["text"])})
+        off += e - s
+    toks = [w["tok"] for w in words]
+    pills, faltan = [], []
+    for frase in frases:
+        ft = [t for t in (_norm(x) for x in frase.split()) if t]
+        hit = next((i for i in range(len(toks) - len(ft) + 1) if toks[i:i + len(ft)] == ft), None)
+        if hit is None:
+            faltan.append(frase)
+            continue
+        ws = words[hit:hit + len(ft)]
+        for k in range(0, len(ws), max_per_pill):
+            trozo = ws[k:k + max_per_pill]
+            pills.append({
+                "show_at": round(max(0.0, trozo[0]["at"] - 0.05), 3),
+                "hide_at": round(min(off, trozo[-1]["end"] + 0.35), 3),
+                "words": [{"text": w["text"], "at": round(max(0.0, w["at"]), 3)} for w in trozo],
+            })
+    pills.sort(key=lambda p: p["show_at"])
+    for i, p in enumerate(pills, start=1):
+        p["id"] = f"pill-{i}"
+    return pills, off, faltan
+
+
 def render_pills_html(pills: list[dict]) -> str:
     """El chip CC va DENTRO de `.kar-words`, como primer item.
 
@@ -192,6 +256,9 @@ def main() -> None:
     ap.add_argument("--output", required=True, type=Path)
     ap.add_argument("--silence-break", type=float, default=0.45)
     ap.add_argument("--max-per-pill", type=int, default=7)
+    ap.add_argument("--frases", type=Path,
+                    help="archivo con una frase clave por linea: solo esas frases llevan "
+                         "subtitulo (el resto del tramo queda sin pill)")
     args = ap.parse_args()
 
     if args.edl:
@@ -202,13 +269,23 @@ def main() -> None:
             raise SystemExit("provide either --edl or both --src-start/--src-end")
         ranges = [(args.src_start, args.src_end)]
 
-    pills, duration = collect_pills_from_ranges(
-        args.transcript, ranges,
-        silence_break=args.silence_break,
-        max_per_pill=args.max_per_pill,
-    )
+    if args.frases:
+        frases = [l.strip() for l in args.frases.read_text(encoding="utf-8").splitlines() if l.strip()]
+        pills, duration, faltan = pills_de_frases(args.transcript, ranges, frases, args.max_per_pill)
+        if faltan:
+            raise SystemExit("frases que NO aparecen en el transcript del tramo (revisar el texto "
+                             "exacto) — no se escribio nada:\n  - " + "\n  - ".join(faltan))
+    else:
+        pills, duration = collect_pills_from_ranges(
+            args.transcript, ranges,
+            silence_break=args.silence_break,
+            max_per_pill=args.max_per_pill,
+        )
     if not pills:
         raise SystemExit("no words found in the given range(s)")
+    n_fix = corregir_encimados(pills)
+    if n_fix:
+        print(f"  {n_fix} pills acortadas para no encimarse con la siguiente")
     total_words = sum(len(p["words"]) for p in pills)
     print(f"ranges={len(ranges)}  words={total_words}  pills={len(pills)}  duration={duration:.2f}s")
 
