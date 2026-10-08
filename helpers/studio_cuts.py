@@ -114,6 +114,39 @@ def to_studio(edit: Path, edl_path: Path, force: bool) -> None:
     pw, ph = probe_wh(next(iter(proxies.values())))
     W, H = (1920, 1080) if pw >= ph else (1080, 1920)
 
+    # Tamaño real de cada fuente: el `reframe` del EDL viene en píxeles del SOURCE
+    src_wh = {}
+    for key, src in edl["sources"].items():
+        p = Path(src) if Path(src).is_absolute() else (edit / src).resolve()
+        src_wh[key] = probe_wh(p)
+
+    def reframe_css(r: dict) -> str:
+        """Simula en Studio el `reframe` de render.py (el proxy no lo lleva).
+
+        Solo visual: recorta con clip-path y mueve/escala con transform para que el
+        clip se vea con el encuadre del render. from-studio no lee el style.
+        """
+        rf = r.get("reframe")
+        if not rf or rf.get("fit") not in ("crop-pad", "crop-scale"):
+            return ""
+        sw, sh = src_wh[r["source"]]
+        k = W / sw                                   # px de lienzo por px de source
+        c = rf["src_crop"]
+        cx, cy, cw, ch = c["x"] * k, c["y"] * k, c["w"] * k, c["h"] * k
+        ow, oh = rf.get("out_size", {}).get("w", W), rf.get("out_size", {}).get("h", H)
+        if rf["fit"] == "crop-pad":                  # reduce si no cabe, centra, nunca amplía
+            s = min(1.0, ow / c["w"], oh / c["h"])
+            tw, th = c["w"] * s * W / ow, c["h"] * s * H / oh
+            mx = my = tw / cw
+        else:                                        # crop-scale: llena la salida
+            tw, th = W, H
+            mx, my = tw / cw, th / ch
+        tx, ty = (W - tw) / 2, (H - th) / 2
+        inset = f"{cy:.1f}px {W - cx - cw:.1f}px {H - cy - ch:.1f}px {cx:.1f}px"
+        return (f' style="clip-path: inset({inset}); transform-origin: 0 0;'
+                f' transform: translate({tx - cx * mx:.1f}px, {ty - cy * my:.1f}px)'
+                f' scale({mx:.4f}, {my:.4f});"')
+
     # Un <video> por range, con inicio absoluto (sin referencias: Studio las pierde al editar)
     cache: dict = {}
     clips, t = [], 0.0
@@ -129,7 +162,7 @@ def to_studio(edit: Path, edl_path: Path, force: bool) -> None:
             f' data-range="{i}" data-source="{escape(r["source"])}"'
             f' data-timeline-label="{escape(label)}"\n'
             f'      data-start="{t:.3f}" data-duration="{dur:.3f}" data-media-start="{r["start"]:.3f}"'
-            f' data-has-audio="true" data-track-index="0" playsinline></video>')
+            f' data-has-audio="true" data-track-index="0"{reframe_css(r)} playsinline></video>')
         t = round(t + dur, 3)
 
     html = f"""<!doctype html>
