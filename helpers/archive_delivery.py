@@ -175,7 +175,8 @@ def main() -> None:
             edl_path.write_text(json.dumps(edl, ensure_ascii=False, indent=1),
                                 encoding="utf-8")
             print(f"\nedl.json: {changed} source(s) reapuntadas a la carpeta nueva")
-        for sub in sorted(edit.glob("stitch/*_edl.json")):
+        # sub-EDLs de los tramos: convencion vieja (stitch/*_edl.json) y la de build_final (stitch/<tramo>/edl.json)
+        for sub in sorted(set(edit.glob("stitch/*_edl.json")) | set(edit.glob("stitch/*/edl.json"))):
             s = json.loads(sub.read_text(encoding="utf-8"))
             ch = 0
             for k, v in list(s.get("sources", {}).items()):
@@ -185,7 +186,7 @@ def main() -> None:
                     ch += 1
             if ch:
                 sub.write_text(json.dumps(s, ensure_ascii=False, indent=1), encoding="utf-8")
-                print(f"{sub.name}: {ch} source(s) reapuntadas")
+                print(f"{sub.relative_to(edit)}: {ch} source(s) reapuntadas")
 
     print(f"\nOK — falta subir la miniatura como {dest / (args.slug + '.png')}")
 
