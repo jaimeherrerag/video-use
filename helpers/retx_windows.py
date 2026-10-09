@@ -146,7 +146,8 @@ def main() -> int:
     data = json.loads((tp if args.solo else orig).read_text(encoding="utf-8"))
     words = sorted((w for w in data["words"] if V.es_palabra(w)), key=lambda w: float(w["start"]))
 
-    db = np.load(edit / "verify" / f"{args.source.stem}.energy.npy")
+    # el mapa de energia lo cachea verify_edl; si aun no existe (video recien transcrito), se mide aqui
+    db = V.mapa_energia(args.source, edit / "verify")
     if args.solo:
         cands = []
         vents = [{"a": float(x.split("-")[0]), "b": float(x.split("-")[1]), "partes": []}
