@@ -13,6 +13,11 @@ edl.json, stitch.json y los slots al dia -> este script arma el video:
      (frases.txt + build_karaoke --frases) y render de HyperFrames (se salta si nada cambio).
   5. stitch.json: partes en orden -> stitch_final.py -> preview_final.mp4.
 
+Shorts (`edl.studio.render == "maestro"`, desde 2026-10-08): el Studio maestro ES la composicion
+final (lienzo 9:16, medios a resolucion completa). Se renderiza la voz con render.py --pcm, se
+regenera el karaoke si cambiaron los cortes, se rehace el maestro desde el EDL (sin los huecos que
+deja Studio al recortar), se renderiza con HyperFrames y stitch_final pone speed, musica y SFX.
+
     uv run python helpers/build_final.py --edit-dir <edit> [--forzar]
 """
 
@@ -75,6 +80,77 @@ def ventana_slot(edit: Path, s: dict) -> tuple[float, float]:
     return s["t"], s["t"] + fin
 
 
+def npm_render(cwd: Path, fps: int, out: str) -> None:
+    npm = ["cmd", "/c", "npm"] if sys.platform == "win32" else ["npm"]
+    run(npm + ["run", "render", "--", "--fps", str(fps), "--quality", "high", "-o", out], cwd=cwd)
+
+
+def build_maestro(edit: Path, edl: dict, spec: dict, spec_path: Path, fps: int, forzar: bool) -> int:
+    """Shorts: el maestro (studio/) se renderiza tal cual; la voz sale del PCM de render.py."""
+    cfg = edl["studio"]
+    stitch_dir = spec_path.parent
+    # 1. voz: render.py --pcm de los cortes de camara (el B-roll y el slot viven en el maestro)
+    d = stitch_dir / "voz"
+    d.mkdir(parents=True, exist_ok=True)
+    sub = {k: v for k, v in edl.items() if k not in ("broll", "studio", "overlays")}
+    sub["overlays"] = []
+    txt = json.dumps(sub, ensure_ascii=False, indent=2)
+    (d / "edl.json").write_text(txt, encoding="utf-8")
+    pcm = d / "voz_pcm.mp4"
+    firma = hashlib.sha1(txt.encode()).hexdigest()
+    cortes_cambiaron = cambio(d / ".edl.sha1", firma, forzar) or not pcm.exists()
+    if cortes_cambiaron:
+        print("voz: render.py --pcm")
+        run(PY + [HELP / "render.py", d / "edl.json", "-o", pcm, "--fps", fps, "--high-quality",
+                  "--pcm", "--no-subtitles"])
+        (d / ".edl.sha1").write_text(firma)
+    else:
+        print(f"voz: sin cambios de cortes, se reutiliza {pcm.name}")
+
+    # 2. karaoke: se recalcula del transcript solo si cambiaron los cortes (pisa ediciones de texto
+    #    hechas en Studio a subtitles.html: avisar)
+    k = cfg.get("karaoke")
+    if k:
+        salida = edit / k["salida"]
+        if cortes_cambiaron or not salida.exists():
+            if salida.exists():
+                print("  aviso: cambiaron los cortes -> el karaoke se regenera del transcript "
+                      "(las correcciones de texto van en transcripts/, no en subtitles.html)")
+            key = next(r["source"] for r in edl["ranges"])
+            cmd = PY + [HELP / "build_karaoke.py", "--transcript", edit / "transcripts" / f"{key}.json",
+                        "--edl", d / "edl.json", "--template", REPO / k["template"], "--output", salida,
+                        "--max-per-pill", str(k.get("max_per_pill", 7))]
+            frases = salida.parent.parent / "frases.txt"
+            if frases.exists():
+                cmd += ["--frases", frases]
+            run(cmd)
+
+    # 3. partes provisionales (voz como video y audio) para que to-studio mida la ganancia real
+    rel_pcm = str(pcm.relative_to(stitch_dir)).replace("\\", "/")
+    spec["parts"] = [{"video": rel_pcm, "audio": rel_pcm}]
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 4. maestro limpio desde el EDL (aborta si hay ediciones de Studio sin exportar)
+    run(PY + [HELP / "studio_maestro.py", "to-studio", "--edit-dir", edit])
+
+    # 5. render de HyperFrames del maestro
+    sdir = edit / "studio"
+    render = sdir / "render_maestro.mp4"
+    firma = sha_de(sdir / "compositions", sdir / "index.html")
+    if cambio(sdir / ".render.sha1", firma, forzar) or not render.exists():
+        print(f"maestro: render de HyperFrames ({dur_video(pcm):.1f}s)")
+        npm_render(sdir, fps, render.name)
+        (sdir / ".render.sha1").write_text(firma)
+    else:
+        print(f"maestro: sin cambios, se reutiliza {render.name}")
+
+    # 6. stitch: video del maestro + voz PCM, speed, musica, SFX, loudnorm
+    spec["parts"] = [{"video": str(Path("..") / render.relative_to(edit)).replace("\\", "/"), "audio": rel_pcm}]
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    run(PY + [HELP / "stitch_final.py", spec_path])
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--edit-dir", required=True, type=Path)
@@ -86,6 +162,8 @@ def main() -> int:
     spec_path = stitch_dir / "stitch.json"
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     fps = int(spec.get("fps", 30))
+    if (edl.get("studio") or {}).get("render") == "maestro":
+        return build_maestro(edit, edl, spec, spec_path, fps, args.forzar)
 
     # --- 1. tramos ------------------------------------------------------------------
     slots = sorted((edl.get("studio") or {}).get("slots", []), key=lambda s: s["t"])

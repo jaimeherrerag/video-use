@@ -54,6 +54,14 @@ def dur(path: Path, stream: str) -> float:
     return float(out[0])
 
 
+def tamano(path: Path) -> tuple[int, int]:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=width,height", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True).stdout.strip()
+    w, h = (int(x) for x in out.split(",")[:2])
+    return w, h
+
+
 def nivel(path: Path) -> tuple[float, float]:
     """(mean_volume, max_volume) en dB."""
     err = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "volumedetect",
@@ -202,10 +210,14 @@ def main() -> int:
     print(f"  loudnorm medido: I={m['input_i']} TP={m['input_tp']} LRA={m['input_lra']}")
 
     # --- 4. encode final: video concat + speed, audio = mezcla normalizada ---------------
+    # tamano de salida: spec["size"] o el de la primera parte (1920x1080 en long-form, 1080x1920 en
+    # shorts; antes estaba fijo en 1920x1080 y un short salia horizontal)
+    sz = spec.get("size") or {}
+    ow, oh = (int(sz["w"]), int(sz["h"])) if sz else tamano(parts[0][0])
     inputs, fc = [], []
     for i, (v, _, d) in enumerate(parts):
         inputs += ["-i", str(v)]
-        fc.append(f"[{i}:v:0]trim=0:{d:.3f},setpts=PTS-STARTPTS,fps={fps},scale=1920:1080:flags=lanczos,"
+        fc.append(f"[{i}:v:0]trim=0:{d:.3f},setpts=PTS-STARTPTS,fps={fps},scale={ow}:{oh}:flags=lanczos,"
                   f"setsar=1,format=yuv420p[v{i}]")
     vs = "".join(f"[v{i}]" for i in range(len(parts)))
     fc.append(f"{vs}concat=n={len(parts)}:v=1:a=0"

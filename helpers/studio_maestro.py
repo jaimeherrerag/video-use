@@ -14,6 +14,14 @@ Studio antes del render final. Este proyecto (<edit>/studio/) es la mesa de trab
   overlays    el CTA y demas overlays con `comp` como sub-composicion (mismo HTML que se
               renderiza en green screen)
   audio       musica y SFX del stitch.json con su volumen relativo a la voz (mezcla_studio)
+  B-roll      (shorts) `edl.broll`: clips de otra fuente encima de la camara, con su encuadre;
+              se recortan, mueven y reencuadran igual que los cortes
+
+Shorts y otros lienzos (desde 2026-10-08): `edl.studio.canvas` = {w, h} (default 1920x1080) y
+`edl.studio.proxy: false` usa copias a resolucion completa (GOP 6) en vez del proxy 540p: un
+short es corto y el maestro se renderiza tal cual (`edl.studio.render: "maestro"`, build_final).
+Capas: z-index por CSS (fondo 0 < camara 1 < B-roll 2 < tarjetas 3 < ... ); un host de slot
+elige la suya con `data-z`.
 
     to-studio   --edit-dir E [--force]   EDL + stitch.json + slots -> E/studio/
     from-studio --edit-dir E [--dry-run] Studio -> edl.json, stitch.json, slots (con respaldos)
@@ -26,9 +34,11 @@ tiene debajo, asi el CTA, las tarjetas y los SFX siguen al contenido.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import json
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from html import escape
@@ -71,6 +81,50 @@ def hosts_de_slot(index: Path) -> list[dict]:
     return [a for tag, a in p.el if a.get("data-composition-src")]
 
 
+def huella(f: Path) -> str:
+    return hashlib.sha1(f.read_bytes()).hexdigest()
+
+
+def editada_en_studio(f: Path, mapa: dict, otra: Path) -> bool:
+    """La composicion f (copia de Studio) cambio DENTRO de Studio desde el to-studio?
+    Se compara contra la huella guardada al generar; asi un cambio hecho por el pipeline en el
+    original (p.ej. el karaoke regenerado) no se pisa con la copia vieja de Studio."""
+    if not f.exists():
+        return False
+    h0 = (mapa.get("comp_sha") or {}).get(f.name)
+    if h0 is None:                                  # maestro generado antes de 2026-10-08
+        return otra.exists() and f.read_bytes() != otra.read_bytes()
+    return huella(f) != h0
+
+
+def etiqueta(texto: str) -> str:
+    """Texto de data-timeline-label, recortado y SIN < ni >: Studio reescribe el archivo con esos
+    caracteres sin escapar y el parser de tiempos de HyperFrames corta el tag en el ">" (visto
+    2026-10-08: el clip quedaba a pantalla completa, sin estilo ni ventana de tiempo)."""
+    texto = texto.replace("->", "→").replace("<", "‹").replace(">", "›")
+    return texto if len(texto) <= LABEL_MAX else texto[:LABEL_MAX - 1].rstrip() + "…"
+
+
+def lienzo(edl_o_mapa: dict) -> tuple[int, int]:
+    """Tamano del lienzo del maestro: edl.studio.canvas (shorts 1080x1920) o el 1920x1080 de siempre."""
+    c = (edl_o_mapa.get("studio") or {}).get("canvas") or edl_o_mapa.get("canvas") or {}
+    return int(c.get("w", W)), int(c.get("h", H))
+
+
+def asset_completo(src: Path, dst: Path) -> None:
+    """Copia a resolucion completa para un maestro sin proxy (shorts): GOP de 6 para que
+    HyperFrames busque exacto al renderizar, y el audio del mic (0:a:0, el mismo de render.py)."""
+    if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+        return
+    print(f"  asset completo: {src.name} -> {dst.name}", flush=True)
+    tmp = dst.with_suffix(".tmp.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?",
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "16", "-pix_fmt", "yuv420p",
+                    "-g", "6", "-keyint_min", "6", "-sc_threshold", "0",
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(tmp)], check=True)
+    tmp.replace(dst)
+
+
 # ── to-studio ─────────────────────────────────────────────────────────────────
 
 def to_studio(edit: Path, force: bool) -> None:
@@ -88,16 +142,25 @@ def to_studio(edit: Path, force: bool) -> None:
             sys.exit("Hay cambios de Studio sin exportar en studio/index.html.\n"
                      "Corre `from-studio` primero, o usa --force para descartarlos.")
 
-    # proxies (se reutiliza el de la revision de cortes si existe) y tamano real de cada fuente
+    st_cfg = edl.get("studio") or {}
+    CW, CH = lienzo(edl)
+    con_proxy = st_cfg.get("proxy", True)
+
+    # medios: proxy 540p (long-form; se reutiliza el de la revision de cortes si existe) o copia a
+    # resolucion completa (shorts), y tamano real de cada fuente
     proxies, dims = {}, {}
     for key, src in edl["sources"].items():
         sp = Path(src) if Path(src).is_absolute() else (edit / src).resolve()
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in key)
-        dst = assets / f"proxy_{safe}.mp4"
-        prev = edit / "cortes" / "assets" / dst.name
-        if not dst.exists() and prev.exists():
-            shutil.copy2(prev, dst)
-        make_proxy(sp, dst)
+        if con_proxy:
+            dst = assets / f"proxy_{safe}.mp4"
+            prev = edit / "cortes" / "assets" / dst.name
+            if not dst.exists() and prev.exists():
+                shutil.copy2(prev, dst)
+            make_proxy(sp, dst)
+        else:
+            dst = assets / f"full_{safe}.mp4"
+            asset_completo(sp, dst)
         proxies[key], dims[key] = dst.name, probe_wh(sp)
 
     lines, t, cache = [], 0.0, {}
@@ -105,11 +168,10 @@ def to_studio(edit: Path, force: bool) -> None:
     for i, r in enumerate(edl["ranges"]):
         d = round(r["end"] - r["start"], 3)
         sw, sh = dims[r["source"]]
-        place = place_de_reframe(r.get("reframe"), sw, sh)
+        place = place_de_reframe(r.get("reframe"), sw, sh, CW, CH)
         css = css_de_place(place, sw, sh)
         text = range_words(edit / "transcripts", r["source"], r["start"], r["end"], cache) or r.get("beat", "")
-        label = f"{i + 1} · {text}"
-        label = label if len(label) <= LABEL_MAX else label[:LABEL_MAX - 1].rstrip() + "…"
+        label = etiqueta(f"{i + 1} · {text}")
         style = f' style="{css}"' if css else ""
         lines.append(
             f'    <video id="c{i + 1:03d}" src="assets/{proxies[r["source"]]}" data-range="{i}"'
@@ -126,13 +188,26 @@ def to_studio(edit: Path, force: bool) -> None:
         for c in r.get("censor") or []:
             t0, t1, place = clip_win[i]
             sw, sh = dims[r["source"]]
-            x, y, wd, ht = fuente_a_lienzo(place, (c["x"], c["y"], c["w"], c["h"]), sw, sh)
+            x, y, wd, ht = fuente_a_lienzo(place, (c["x"], c["y"], c["w"], c["h"]), sw, sh, CW, CH)
             nb += 1
             lines.append(
                 f'    <div id="blur-{nb:02d}" class="clip blur-censura" data-timeline-label="Blur {nb} (censura)"\n'
                 f'      data-start="{t0:.3f}" data-duration="{t1 - t0:.3f}" data-track-index="1"\n'
                 f'      style="position: absolute; left: {x:.1f}px; top: {y:.1f}px; width: {wd:.1f}px; '
                 f'height: {ht:.1f}px;"></div>')
+
+    # B-roll (shorts): clips de otra fuente encima de la camara, con su encuadre editable
+    for k, b in enumerate(edl.get("broll") or []):
+        sw, sh = dims[b["source"]]
+        css = css_de_place(place_de_reframe(b.get("reframe"), sw, sh, CW, CH), sw, sh)
+        label = etiqueta(f"B-roll {k + 1} · {b.get('nota', b['source'])}")
+        style = f' style="{css}"' if css else ""
+        lines.append(
+            f'    <video id="b{k + 1:02d}" src="assets/{proxies[b["source"]]}" data-broll="{k}"'
+            f' data-source="{escape(b["source"])}" data-timeline-label="{escape(label)}"\n'
+            f'      data-start="{b["at"]:.3f}" data-duration="{b["end"] - b["start"]:.3f}"'
+            f' data-media-start="{b["start"]:.3f}" data-has-audio="false" data-track-index="1"'
+            f'{style} muted playsinline></video>')
 
     # slots HF (tarjetas, karaoke...): sus hosts en el timeline maestro
     mapa_slots = {}
@@ -150,7 +225,7 @@ def to_studio(edit: Path, force: bool) -> None:
                 f'    <div id="{h["id"]}" class="scene-layer clip" data-composition-id="{h["data-composition-id"]}"\n'
                 f'      data-composition-src="{h["data-composition-src"]}" data-timeline-label="{escape(h["id"])}"\n'
                 f'      data-start="{st:.3f}" data-duration="{du:.3f}" data-track-index="{h.get("data-track-index", 2)}"\n'
-                f'      data-width="{W}" data-height="{H}"></div>')
+                f'      data-width="{CW}" data-height="{CH}" style="z-index: {h.get("data-z", 3)};"></div>')
             mapa_slots[h["id"]] = {"slot": s["dir"], "t": s["t"], "src": h["data-composition-src"]}
 
     # overlays con composicion (CTA): misma pieza que se renderiza en green screen
@@ -166,7 +241,7 @@ def to_studio(edit: Path, force: bool) -> None:
             f'    <div id="{cid}" class="scene-layer clip" data-composition-id="{comp_id}"\n'
             f'      data-composition-src="compositions/{cf.name}" data-timeline-label="Overlay {k + 1} · {cf.stem}"\n'
             f'      data-start="{ov["start_in_output"]:.3f}" data-duration="{ov["duration"]:.3f}" data-track-index="8"\n'
-            f'      data-width="{W}" data-height="{H}"></div>')
+            f'      data-width="{CW}" data-height="{CH}" style="z-index: 7;"></div>')
         mapa_ov.append({"id": cid, "idx": k, "comp": ov["comp"]})
 
     # audio (musica + SFX) con la ganancia real del loudnorm
@@ -187,15 +262,19 @@ def to_studio(edit: Path, force: bool) -> None:
 <html lang="es">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width={W}, height={H}"/>
+  <meta name="viewport" content="width={CW}, height={CH}"/>
   <title>Studio maestro</title>
   <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
   <style>
-    html, body {{ margin: 0; width: {W}px; height: {H}px; overflow: hidden; background: #000; }}
-    #root {{ position: relative; width: {W}px; height: {H}px; overflow: hidden; }}
+    html, body {{ margin: 0; width: {CW}px; height: {CH}px; overflow: hidden; background: #000; }}
+    #root {{ position: relative; width: {CW}px; height: {CH}px; overflow: hidden; }}
     #root video {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; }}
-    .scene-layer {{ position: absolute; top: 0; left: 0; width: {W}px; height: {H}px; }}
-    .blur-censura {{ backdrop-filter: blur(16px); background: rgba(239, 68, 68, 0.10);
+    /* capas por z-index (el track de Studio no ordena): camara 1, B-roll 2, tarjetas 3 (o su data-z),
+       blur 6, overlays 7 */
+    #root video[data-range] {{ z-index: 1; }}
+    #root video[data-broll] {{ z-index: 2; }}
+    .scene-layer {{ position: absolute; top: 0; left: 0; width: {CW}px; height: {CH}px; z-index: 3; }}
+    .blur-censura {{ z-index: 6; backdrop-filter: blur(16px); background: rgba(239, 68, 68, 0.10);
                     outline: 3px dashed rgba(239, 68, 68, 0.9); }}
   </style>
 </head>
@@ -204,7 +283,7 @@ def to_studio(edit: Path, force: bool) -> None:
        Cortes, encuadres, blurs, tarjetas, CTA, musica y SFX se editan aqui; from-studio los
        devuelve al pipeline. A 1x (el entregable va a {spec.get("speed", 1) if spec else 1}x). -->
   <div id="root" data-composition-id="maestro" data-start="0" data-duration="{total:.3f}"
-    data-width="{W}" data-height="{H}">
+    data-width="{CW}" data-height="{CH}">
 {chr(10).join(lines)}
   </div>
   <script>
@@ -218,14 +297,17 @@ def to_studio(edit: Path, force: bool) -> None:
     index.write_text(html, encoding="utf-8")
     stamp.write_text(sha(html))
     mapa = {"ranges": edl["ranges"], "dims": dims, "slots": mapa_slots, "overlays": mapa_ov,
-            "audio": mapa_audio, "total": total}
+            "audio": mapa_audio, "total": total, "canvas": {"w": CW, "h": CH},
+            "broll": edl.get("broll") or [],
+            "comp_sha": {f.name: huella(f) for f in comps.glob("*.html")}}
     (out / "maestro_map.json").write_text(json.dumps(mapa, ensure_ascii=False, indent=2), encoding="utf-8")
     pkg = load_json(PRESET / "package.json")
     pkg["name"] = "studio"
     (out / "package.json").write_text(json.dumps(pkg, indent=2), encoding="utf-8")
     shutil.copy(PRESET / "hyperframes.json", out / "hyperframes.json")
     n_rf = sum(1 for r in edl["ranges"] if r.get("reframe"))
-    print(f"studio maestro: {len(edl['ranges'])} cortes ({n_rf} con encuadre), {nb} blurs, "
+    print(f"studio maestro {CW}x{CH}: {len(edl['ranges'])} cortes ({n_rf} con encuadre), "
+          f"{len(edl.get('broll') or [])} B-roll, {nb} blurs, "
           f"{len(mapa_slots)} sub-comps de slots, {len(mapa_ov)} overlays, "
           f"{len(mapa_audio['music']) if mapa_audio else 0} musica + {len(mapa_audio['sfx']) if mapa_audio else 0} SFX"
           f" | {fmt_t(total)} -> {index}")
@@ -237,8 +319,10 @@ def from_studio(edit: Path, dry: bool) -> None:
     out = edit / DIR
     mapa = load_json(out / "maestro_map.json")
     base_ranges, dims = mapa["ranges"], {k: tuple(v) for k, v in mapa["dims"].items()}
+    CW, CH = lienzo(mapa)
+    html_studio = (out / "index.html").read_text(encoding="utf-8")
     p = Elementos()
-    p.feed((out / "index.html").read_text(encoding="utf-8"))
+    p.feed(html_studio)
     por_id = {a["id"]: (tag, a) for tag, a in p.el}
 
     # 1) clips -> ranges, en el orden de Studio; su ventana en Studio y en la SALIDA
@@ -254,20 +338,24 @@ def from_studio(edit: Path, dry: bool) -> None:
         ms, du = float(a.get("data-media-start", 0)), float(a["data-duration"])
         r["start"], r["end"] = round(ms, 3), round(ms + du, 3)
         sw, sh = dims[r["source"]]
-        place = place_de_css(a.get("style", ""), sw, sh)
+        place = place_de_css(a.get("style", ""), sw, sh, CW, CH)
         if place and place.get("oculto"):
             notas.append(f"  {a['id']}: el clip quedo fuera del lienzo -> se descarta")
             continue
-        p_orig = place_de_reframe(orig.get("reframe"), sw, sh)
+        p_orig = place_de_reframe(orig.get("reframe"), sw, sh, CW, CH)
         if place is None:
             r.pop("reframe", None)
         elif not (p_orig and all(abs(x - y) < 2 for x, y in zip(place["src"] + place["dst"],
                                                                p_orig["src"] + p_orig["dst"]))):
-            r["reframe"] = reframe_de_place(place)
+            r["reframe"] = reframe_de_place(place, CW, CH)
             # Un arrastre accidental de pocos px deja una franja negra casi invisible en Studio
+            # (en un short la camara ocupa solo la mitad de abajo: solo cuentan los bordes del lienzo
+            # que el clip ya tocaba)
             dx, dy, dw, dh = place["dst"]
-            bordes = [n for n, g in (("izq", dx), ("arriba", dy), ("der", W - dx - dw),
-                                     ("abajo", H - dy - dh)) if 0.5 < g < 12]
+            ox, oy, ow, oh = p_orig["dst"] if p_orig else (0, 0, CW, CH)
+            bordes = [n for n, g, toca in (("izq", dx, ox < 1), ("arriba", dy, oy < 1),
+                                           ("der", CW - dx - dw, ox + ow > CW - 1),
+                                           ("abajo", CH - dy - dh, oy + oh > CH - 1)) if toca and 0.5 < g < 12]
             if bordes:
                 notas.append(f"  {a['id']}: OJO franja negra de pocos px ({', '.join(bordes)}) "
                              "-> ¿se movio sin querer?")
@@ -295,7 +383,7 @@ def from_studio(edit: Path, dry: bool) -> None:
         for s0, s1, _, place, r in wins:
             if s1 > b0 and s0 < b1:
                 sw, sh = dims[r["source"]]
-                x, y, wd, ht = lienzo_a_fuente(place, rect, sw, sh)
+                x, y, wd, ht = lienzo_a_fuente(place, rect, sw, sh, CW, CH)
                 x0, y0 = max(0, int(x)), max(0, int(y))
                 box = {"x": x0, "y": y0, "w": int(min(sw, x + wd) - x0), "h": int(min(sh, y + ht) - y0)}
                 if box["w"] > 2 and box["h"] > 2:
@@ -304,6 +392,45 @@ def from_studio(edit: Path, dry: bool) -> None:
     n_cens0 = sum(len(r.get("censor") or []) for r in base_ranges)
     if n_cens != n_cens0:
         notas.append(f"  blurs: {n_cens0} -> {n_cens} cajas de censura")
+
+    # 2b) B-roll (shorts): inicio en la salida, tramo de su fuente y encuadre
+    broll = []
+    base_broll = mapa.get("broll") or []
+    vistos = set()
+    for tag, a in p.el:
+        if tag != "video" or "data-broll" not in a or oculto(a):
+            continue
+        k = int(a["data-broll"])
+        orig = base_broll[k]
+        b = dict(orig)
+        sw, sh = dims[b["source"]]
+        s0, du = float(a.get("data-start", 0)), float(a["data-duration"])
+        o0, o1 = a_salida(s0), a_salida(s0 + du)
+        ms = float(a.get("data-media-start", 0))
+        b["at"], b["start"], b["end"] = round(o0, 3), round(ms, 3), round(ms + (o1 - o0), 3)
+        place = place_de_css(a.get("style", ""), sw, sh, CW, CH)
+        if place and place.get("oculto"):
+            notas.append(f"  {a['id']}: B-roll fuera del lienzo -> se descarta")
+            continue
+        p_orig = place_de_reframe(orig.get("reframe"), sw, sh, CW, CH)
+        if place is None:
+            b.pop("reframe", None)
+        elif not (p_orig and all(abs(x - y) < 2 for x, y in zip(place["src"] + place["dst"],
+                                                               p_orig["src"] + p_orig["dst"]))):
+            b["reframe"] = reframe_de_place(place, CW, CH)
+        cambios_b = [c for c in ("at", "start", "end") if abs(b[c] - orig[c]) > 0.02]
+        if b.get("reframe") != orig.get("reframe"):
+            cambios_b.append("encuadre")
+        if k in vistos:
+            cambios_b.append("partido")
+        vistos.add(k)
+        if cambios_b:
+            notas.append(f"  {a['id']}: B-roll {', '.join(cambios_b)}")
+        broll.append(b)
+    for k in range(len(base_broll)):
+        if k not in vistos:
+            notas.append(f"  b{k + 1:02d}: B-roll eliminado")
+    broll.sort(key=lambda b: b["at"])
 
     # 3) slots: tiempos de sus hosts (relativos al slot) y archivos de composicion
     cambios_slot: dict[str, list] = {}
@@ -363,6 +490,8 @@ def from_studio(edit: Path, dry: bool) -> None:
     bk.mkdir(exist_ok=True)
     shutil.copy2(edit / "edl.json", bk / f"edl_{stamp}.json")
     edl["ranges"], edl["overlays"] = ranges, overlays
+    if base_broll or broll:
+        edl["broll"] = broll
     (edit / "edl.json").write_text(json.dumps(edl, ensure_ascii=False, indent=2), encoding="utf-8")
     # composiciones editadas en Studio -> de vuelta a su slot / overlay
     for sdir, hs in cambios_slot.items():
@@ -375,13 +504,14 @@ def from_studio(edit: Path, dry: bool) -> None:
             txt = re.sub(rf'(id="{re.escape(hid)}"[^>]*?data-start=")[\d.]+(")', rf"\g<1>{st:.3f}\g<2>", txt, count=1)
             txt = re.sub(rf'(id="{re.escape(hid)}"[^>]*?data-duration=")[\d.]+(")', rf"\g<1>{du:.3f}\g<2>", txt, count=1)
             f = out / src
-            if f.exists() and f.read_bytes() != (sp / src).read_bytes():
+            if editada_en_studio(f, mapa, sp / src):
+                shutil.copy2(sp / src, bk / f"{Path(src).stem}_{stamp}.html")
                 shutil.copy2(f, sp / src)
                 print(f"  {src}: editada en Studio -> copiada a {sdir}")
         idx.write_text(txt, encoding="utf-8")
     for info in mapa["overlays"]:
         f, dst = out / "compositions" / Path(info["comp"]).name, (edit / info["comp"]).resolve()
-        if f.exists() and dst.exists() and f.read_bytes() != dst.read_bytes():
+        if dst.exists() and editada_en_studio(f, mapa, dst):
             shutil.copy2(f, dst)
             print(f"  {info['comp']}: editada en Studio -> hay que re-renderizar el overlay")
     if music is not None and cambios_audio:
@@ -389,6 +519,9 @@ def from_studio(edit: Path, dry: bool) -> None:
         shutil.copy2(spec_path, bk / f"stitch_{stamp}.json")
         spec["music"], spec["sfx"] = music, sfx
         spec_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    # este estado de Studio ya quedo exportado: to-studio puede regenerar sin --force (Studio
+    # reescribe el archivo al abrirlo, p.ej. con data-hf-id, y eso no es una edicion pendiente)
+    (out / ".generated.sha1").write_text(sha(html_studio))
     print(f"  escrito edl.json (respaldos en edl_backups/, {stamp})")
 
 
