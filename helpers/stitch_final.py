@@ -88,7 +88,9 @@ def cargar_partes(spec: dict, base: Path, verbose: bool = False) -> list[tuple[P
     parts = []
     for p in spec["parts"]:
         v, a = (base / p["video"]).resolve(), (base / p["audio"]).resolve()
-        d, dv = dur(a, "v:0"), dur(v, "v:0")
+        # base PCM de render.py (con video) o voz exacta en WAV (shorts del maestro, sin video)
+        d = dur(a, "v:0") if a.suffix.lower() not in (".wav", ".flac") else dur(a, "a:0")
+        dv = dur(v, "v:0") if v.suffix.lower() not in (".wav", ".flac") else d   # parte provisional (solo medir)
         if dv + 0.02 < d:
             sys.exit(f"{v.name} dura {dv:.3f}s y su base {d:.3f}s: el video quedaria corto")
         parts.append((v, a, d))

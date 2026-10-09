@@ -89,20 +89,35 @@ def build_maestro(edit: Path, edl: dict, spec: dict, spec_path: Path, fps: int, 
     """Shorts: el maestro (studio/) se renderiza tal cual; la voz sale del PCM de render.py."""
     cfg = edl["studio"]
     stitch_dir = spec_path.parent
-    # 1. voz: render.py --pcm de los cortes de camara (el B-roll y el slot viven en el maestro)
+    # 1. voz con los tiempos EXACTOS de cada corte (a la muestra), que es como los coloca el maestro.
+    #    render.py cuantiza cada corte a cuadros: con 20 cortes la voz acumulaba ~0.1 s de adelanto
+    #    contra el video del maestro (visto 2026-10-08). Mismo fade de 30 ms por borde que render.py.
     d = stitch_dir / "voz"
     d.mkdir(parents=True, exist_ok=True)
     sub = {k: v for k, v in edl.items() if k not in ("broll", "studio", "overlays")}
     sub["overlays"] = []
     txt = json.dumps(sub, ensure_ascii=False, indent=2)
     (d / "edl.json").write_text(txt, encoding="utf-8")
-    pcm = d / "voz_pcm.mp4"
+    pcm = d / "voz.wav"
     firma = hashlib.sha1(txt.encode()).hexdigest()
-    cortes_cambiaron = cambio(d / ".edl.sha1", firma, forzar) or not pcm.exists()
-    if cortes_cambiaron:
-        print("voz: render.py --pcm")
-        run(PY + [HELP / "render.py", d / "edl.json", "-o", pcm, "--fps", fps, "--high-quality",
-                  "--pcm", "--no-subtitles"])
+    cortes_cambiaron = cambio(d / ".edl.sha1", firma, forzar)
+    if cortes_cambiaron or not pcm.exists():
+        print("voz: cortes exactos de la fuente -> voz.wav")
+        claves = list(dict.fromkeys(r["source"] for r in edl["ranges"]))
+        entradas = []
+        for k in claves:
+            src = Path(edl["sources"][k])
+            entradas += ["-i", src if src.is_absolute() else (edit / src).resolve()]
+        fc = []
+        for i, r in enumerate(edl["ranges"]):
+            du = r["end"] - r["start"]
+            fc.append(f"[{claves.index(r['source'])}:a:0]atrim=start={r['start']:.4f}:end={r['end']:.4f},"
+                      f"asetpts=PTS-STARTPTS,aresample=48000,afade=t=in:st=0:d=0.03,"
+                      f"afade=t=out:st={max(0.0, du - 0.03):.4f}:d=0.03[a{i}]")
+        n = len(edl["ranges"])
+        fc.append("".join(f"[a{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1[voz]")
+        run(["ffmpeg", "-v", "error", "-y", *entradas, "-filter_complex", ";".join(fc),
+             "-map", "[voz]", "-c:a", "pcm_s16le", "-ar", "48000", pcm])
         (d / ".edl.sha1").write_text(firma)
     else:
         print(f"voz: sin cambios de cortes, se reutiliza {pcm.name}")
@@ -138,7 +153,7 @@ def build_maestro(edit: Path, edl: dict, spec: dict, spec_path: Path, fps: int, 
     render = sdir / "render_maestro.mp4"
     firma = sha_de(sdir / "compositions", sdir / "index.html")
     if cambio(sdir / ".render.sha1", firma, forzar) or not render.exists():
-        print(f"maestro: render de HyperFrames ({dur_video(pcm):.1f}s)")
+        print("maestro: render de HyperFrames")
         npm_render(sdir, fps, render.name)
         (sdir / ".render.sha1").write_text(firma)
     else:
