@@ -82,7 +82,10 @@ def hosts_de_slot(index: Path) -> list[dict]:
 
 
 def huella(f: Path) -> str:
-    return hashlib.sha1(f.read_bytes()).hexdigest()
+    """Huella del contenido SIN los data-hf-id: Studio se los agrega a toda composicion que abre,
+    y eso no es una edicion (antes se copiaba de vuelta y pisaba los cambios del pipeline)."""
+    txt = re.sub(r'\s+data-hf-id="[^"]*"', "", f.read_text(encoding="utf-8"))
+    return hashlib.sha1(txt.encode("utf-8")).hexdigest()
 
 
 def editada_en_studio(f: Path, mapa: dict, otra: Path) -> bool:
@@ -93,7 +96,7 @@ def editada_en_studio(f: Path, mapa: dict, otra: Path) -> bool:
         return False
     h0 = (mapa.get("comp_sha") or {}).get(f.name)
     if h0 is None:                                  # maestro generado antes de 2026-10-08
-        return otra.exists() and f.read_bytes() != otra.read_bytes()
+        return otra.exists() and huella(f) != huella(otra)
     return huella(f) != h0
 
 
@@ -442,6 +445,11 @@ def from_studio(edit: Path, dry: bool) -> None:
         a = tag_a[1]
         s0 = float(a["data-start"])
         o0, o1 = a_salida(s0), a_salida(s0 + float(a["data-duration"]))
+        # lo que llegaba al final del video (fondo, karaoke, tarjeta de cierre) sigue al nuevo final
+        # si Jaime alargo o recorto el ultimo clip
+        if abs(s0 + float(a["data-duration"]) - mapa["total"]) < 0.05 and abs(t_out - mapa["total"]) > 0.02:
+            o1 = t_out
+            notas.append(f"  {hid}: termina con el video ({mapa['total']:.2f} -> {t_out:.2f})")
         cambios_slot.setdefault(info["slot"], []).append((hid, round(o0 - info["t"], 3), round(o1 - o0, 3), info["src"]))
 
     # 4) overlays (CTA): inicio en la salida
