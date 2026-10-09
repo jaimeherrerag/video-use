@@ -264,6 +264,13 @@ def from_studio(edit: Path, dry: bool) -> None:
         elif not (p_orig and all(abs(x - y) < 2 for x, y in zip(place["src"] + place["dst"],
                                                                p_orig["src"] + p_orig["dst"]))):
             r["reframe"] = reframe_de_place(place)
+            # Un arrastre accidental de pocos px deja una franja negra casi invisible en Studio
+            dx, dy, dw, dh = place["dst"]
+            bordes = [n for n, g in (("izq", dx), ("arriba", dy), ("der", W - dx - dw),
+                                     ("abajo", H - dy - dh)) if 0.5 < g < 12]
+            if bordes:
+                notas.append(f"  {a['id']}: OJO franja negra de pocos px ({', '.join(bordes)}) "
+                             "-> ¿se movio sin querer?")
         if (r.get("reframe") or None) != (orig.get("reframe") or None):
             notas.append(f"  {a['id']}: encuadre {'quitado' if 'reframe' not in r else 'nuevo ' + str(r['reframe']['src_crop'])}")
         st = float(a.get("data-start", 0))
