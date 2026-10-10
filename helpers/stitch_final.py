@@ -2,7 +2,7 @@
 """stitch_final.py - une tramos (HyperFrames + render.py) en el entregable final.
 
 Reemplaza al `stitch_final.ps1` que se quedo en la PC vieja. Implementa las reglas del
-CLAUDE.md ("Liquid-glass solo en un tramo -> render parcial + stitch" y "Musica y
+CLAUDE.md ("Pipeline preset: liquid glass" -> stitch.json, y "Musica y
 efectos de sonido"):
 
   - VIDEO: de cada parte (render de HF o salida --pcm de render.py), recortado a la
