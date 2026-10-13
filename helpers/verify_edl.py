@@ -43,6 +43,7 @@ HABLA_DB = -30.0         # hueco con RMS mayor a esto = habla perdida, no respir
 VENTANA_MS = 50          # RMS por ventanas de 50 ms
 BLIP_MAX = 0.10          # run de voz mas corto que esto = click, no habla
 MARGEN_CLAMP = 2.5       # cuanto puede exceder una word su duracion esperada
+CORTE_VOZ_MIN = 0.10     # voz que sigue (o empezo) mas alla del corte: >=0.10s se come parte de una palabra
                          # antes de considerarla estirada (2.5x deja pasar
                          # URLs y dominios leidos enteros)
 
@@ -424,6 +425,39 @@ def verificar(edl, edit_dir, transcripts, energia):
             if RE_FILLER.match(txt(w)):
                 add("INFO", "filler", i, out_t + (float(w["start"]) - s),
                     f"filler vocal '{txt(w)}' como token suelto", float(w["start"]))
+
+        # Check 9: corte dentro de voz (2026-10-12, short de REA).
+        # El boundary se pone con los timestamps del ASR; si estan corridos (numeros,
+        # anglicismos, words fantasma), el corte cae a mitad de una palabra y la voz
+        # sigue sonando del otro lado. Se mide con el mapa de energia, no con el
+        # transcript. Los runs se fusionan (hueco <=0.15s) porque "estrellas" o
+        # "GitHub" tienen oclusivas internas que parten la palabra en dos runs.
+        if db is not None:
+            sig = ranges[i + 1] if i + 1 < len(ranges) else None
+            pegado_sig = (sig is not None and sig.get("source") == key
+                          and abs(float(sig["start"]) - e) <= 0.05)
+            if not pegado_sig:
+                for rs, rf in fusionar_runs(runs_voz(db, e - 0.6, e + 1.0)):
+                    if rs < e - 0.02 and rf - e >= CORTE_VOZ_MIN:
+                        pico = db_pico(db, e, min(rf, e + 0.5))
+                        if pico > HABLA_DB:
+                            add("WARN", "corte-en-voz", i, out_t + dur,
+                                f"la voz sigue {rf - e:.2f}s despues del corte (pico {pico:.0f} dB): "
+                                "posible final de palabra cortado - confirmar con audit_bordes.py "
+                                "(respiraciones y muletillas pegadas al corte tambien disparan esto)", e)
+                        break
+            ant = ranges[i - 1] if i > 0 else None
+            pegado_ant = (ant is not None and ant.get("source") == key
+                          and abs(float(ant["end"]) - s) <= 0.05)
+            if not pegado_ant:
+                for rs, rf in fusionar_runs(runs_voz(db, s - 1.0, s + 0.6)):
+                    if rf > s + 0.02 and s - rs >= CORTE_VOZ_MIN:
+                        pico = db_pico(db, max(rs, s - 0.5), s)
+                        if pico > HABLA_DB:
+                            add("WARN", "corte-en-voz", i, out_t,
+                                f"la voz empezo {s - rs:.2f}s antes del corte (pico {pico:.0f} dB): "
+                                "se come el inicio de una palabra - medir con silencios reales", s)
+                        break
 
     # --- Check 3: gaps inter-range (Preset 5) ------------------------------
     #
