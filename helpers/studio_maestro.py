@@ -248,7 +248,9 @@ def to_studio(edit: Path, force: bool) -> None:
                 print(f"  aviso: el sujeto del clip {i + 1} queda fuera del clip -> no se emite")
             continue
         a, b = w
-        nombre, span0 = asset_sujeto(edit, assets / proxies[r["source"]], a, b, assets)
+        # sobre un fondo liso el borde lleva el color del sujeto; sobre la camara real, el de la camara
+        nombre, span0 = asset_sujeto(edit, assets / proxies[r["source"]], a, b, assets,
+                                     relleno=bool(r["sujeto"].get("fondo")))
         st0, du = round(t0 + a - r["start"], 3), round(b - a, 3)
         if any(e["T"] < st0 + du and e["T"] + e["dur"] > st0 for e in trans):
             print(f"  aviso: el recorte del clip {i + 1} se cruza con una transicion de color: "

@@ -43,7 +43,7 @@ from typing import Callable
 HF = "0.8.140"
 FPS = 30
 MARGEN = 0.5                       # s de fuente de mas a cada lado del recorte (recortes en Studio)
-MASCARA = 2                        # version del post-proceso del borde (_limpiar_mascara)
+MASCARA = 4                        # version del post-proceso del borde (_limpiar_mascara)
 TRACK_FONDO, TRACK_SUJETO, TRACK_COLOR = 19, 20, 30
 # cortinilla diagonal: la zona "despues" entra desde la derecha; el borde va inclinado 20% del ancho
 POLY_INI = "polygon(120% 0%, 140% 0%, 140% 100%, 100% 100%)"
@@ -74,20 +74,70 @@ def _tramo(full: Path, s0: float, s1: float, dst: Path) -> None:
                     str(dst)], check=True)
 
 
-def _limpiar_mascara(tramo: Path, crudo: Path, dst: Path) -> None:
-    """Borde firme (version MASCARA): el alfa de u2net se cierra ~2 px hacia adentro, la franja
-    semitransparente se reduce (25-75% -> 0-100%) y se suaviza 0.7 px, y el color es el EXACTO de la
-    camara (el del tramo, no el del webm). Sin esto, en el Studio de Jaime se veia una linea blanca de
-    ~3 px alrededor del recorte graduado y un halo lila sobre el fondo liso (2026-10-12)."""
-    fc = ("[1:v]alphaextract,erosion,erosion,lut=c0='clip((val-64)*2,0,255)',gblur=sigma=0.7[a];"
-          "[0:v][a]alphamerge,format=yuva420p[v]")
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(tramo), "-c:v", "libvpx-vp9", "-i", str(crudo),
-                    "-filter_complex", fc, "-map", "[v]", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
-                    "-crf", "18", "-b:v", "0", "-deadline", "good", "-cpu-used", "4", "-row-mt", "1",
-                    "-g", "1", "-auto-alt-ref", "0", str(dst)], check=True)
+def _limpiar_mascara(tramo: Path, crudo: Path, dst: Path, relleno: bool = True) -> None:
+    """Borde limpio del recorte (version MASCARA), cuadro por cuadro:
+    - alfa: el de u2net cerrado ~2 px hacia adentro, con la franja semitransparente reducida
+      (25-75% -> 0-100%) y suavizada 0.6 px;
+    - color: el EXACTO de la camara, salvo en el borde semitransparente y 3 px afuera, donde va el
+      color del propio sujeto extendido hacia afuera (convolucion normalizada), no el de la pared. Mas
+      lejos vuelve la camara: con color oscuro ahi, el alfa residual de la compresion (~2/255 de media,
+      picos en pelos finos) dejaba una sombra alrededor del pelo en el render (v3, 2026-10-13).
+      Con `relleno=False` (recorte sobre la camara real) el color es el de la camara en todo el cuadro:
+      ahi compone casi identico a la camara (0.9 niveles de diferencia en el borde, contra 6.8 con
+      relleno), y el relleno solo sirve sobre un fondo liso.
+    Por que (2026-10-12/13): con el color de la pared (lila casi blanco) en los pixeles transparentes,
+    el Studio de Jaime pintaba una linea blanca de ~3 px alrededor de los recortes graduados, y sobre
+    el fondo liso quedaba un halo lila. En el render no se veia, pero un visor que mezcla vecinos del
+    borde (al escalar, al subir la textura) jala ese color."""
+    import numpy as np
+    from scipy import ndimage
+
+    w, h = (int(x) for x in subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+         "-of", "csv=p=0", str(tramo)], capture_output=True, text=True, check=True).stdout.strip().split(","))
+    dec_c = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(tramo), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                             stdout=subprocess.PIPE)
+    dec_a = subprocess.Popen(["ffmpeg", "-v", "error", "-c:v", "libvpx-vp9", "-i", str(crudo), "-vf", "alphaextract",
+                              "-f", "rawvideo", "-pix_fmt", "gray", "-"], stdout=subprocess.PIPE)
+    enc = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}",
+                            "-r", str(FPS), "-i", "-", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-crf", "18",
+                            "-b:v", "0", "-deadline", "good", "-cpu-used", "4", "-row-mt", "1", "-g", "1",
+                            "-auto-alt-ref", "0", str(dst)], stdin=subprocess.PIPE)
+    n = 0
+    while True:
+        bc, ba = dec_c.stdout.read(w * h * 3), dec_a.stdout.read(w * h)
+        if len(bc) < w * h * 3 or len(ba) < w * h:
+            break
+        c = np.frombuffer(bc, np.uint8).reshape(h, w, 3).astype(np.float32)
+        a = np.frombuffer(ba, np.uint8).reshape(h, w).astype(np.float32) / 255
+        a = ndimage.grey_erosion(a, size=(5, 5))
+        a = ndimage.gaussian_filter(np.clip((a - 0.25) / 0.5, 0, 1), 0.6)
+        solido = (a >= 0.98).astype(np.float32)
+        rgb = c.copy()
+        # solo la franja de 3 px pegada al borde lleva el color del sujeto (la que un visor mezcla al
+        # escalar); mas afuera queda la camara, asi el alfa residual de la compresion no ensucia el render
+        hueco = ndimage.binary_dilation(a > 0.02, iterations=3) & (solido < 1)
+        if not relleno:
+            hueco[:] = False
+        for tam in (15, 61):                      # primero el color cercano, luego el lejano
+            den = ndimage.uniform_filter(solido, tam)
+            num = np.stack([ndimage.uniform_filter(c[..., k] * solido, tam) for k in range(3)], -1)
+            ok = hueco & (den > 1e-3)
+            rgb[ok] = num[ok] / den[ok][:, None]
+            hueco &= ~ok
+        if hueco.any():
+            rgb[hueco] = c[solido > 0].mean(0) if solido.any() else c[hueco]
+        enc.stdin.write(np.dstack([rgb, a * 255]).clip(0, 255).astype(np.uint8).tobytes())
+        n += 1
+    enc.stdin.close()
+    for pr in (dec_c, dec_a, enc):
+        pr.wait()
+    if enc.returncode != 0 or n == 0:
+        sys.exit(f"limpieza del borde fallo ({n} cuadros)")
 
 
-def asset_sujeto(edit: Path, full: Path, a: float, b: float, assets: Path) -> tuple[str, float]:
+def asset_sujeto(edit: Path, full: Path, a: float, b: float, assets: Path,
+                 relleno: bool = True) -> tuple[str, float]:
     """Recorte (webm con alfa) que cubre [a, b] de la fuente `full` (la misma copia que usa la camara
     del maestro, asi los cuadros coinciden). Reusa uno de la cache si su tramo lo contiene; si no,
     genera [a - 0.5, b + 0.5] alineado a cuadros. En la cache quedan el crudo de remove-background
@@ -126,13 +176,13 @@ def asset_sujeto(edit: Path, full: Path, a: float, b: float, assets: Path) -> tu
         print("   ", next((x for x in reversed(lineas) if "Removed background" in x), lineas[-1] if lineas else "ok"))
         idx[crudo.name] = {"fuente": full.name, "firma": firma, "span": [round(s0, 3), round(s1, 3)]}
         idx_p.write_text(json.dumps(idx, indent=2), encoding="utf-8")
-    limpio = crudo.with_name(f"{crudo.stem}_m{MASCARA}.webm")
+    limpio = crudo.with_name(f"{crudo.stem}_m{MASCARA}{'' if relleno else 'c'}.webm")
     if not limpio.exists():
         print(f"  borde del recorte: {limpio.name}", flush=True)
         tramo = cache / f"_tramo_{crudo.stem}.mp4"
         if not tramo.exists():
             _tramo(full, s0, s1, tramo)
-        _limpiar_mascara(tramo, crudo, limpio)
+        _limpiar_mascara(tramo, crudo, limpio, relleno)
         tramo.unlink(missing_ok=True)
     _copiar(limpio, assets / limpio.name)
     return limpio.name, s0
