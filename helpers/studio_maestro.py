@@ -256,7 +256,8 @@ def to_studio(edit: Path, force: bool) -> None:
         lk = look_en(st0)
         sujetos.append({"n": len(sujetos) + 1, "i": i, "t0": st0, "dur": du, "ms": round(a - span0, 3),
                         "asset": nombre, "fondo": r["sujeto"].get("fondo"),
-                        "fondo_hasta": r["sujeto"].get("fondo_hasta"), "css": css_clip[i],
+                        "fondo_hasta": r["sujeto"].get("fondo_hasta"),
+                        "fondo_hueco": r["sujeto"].get("fondo_hueco"), "css": css_clip[i],
                         "look": looks.get(lk) if lk else None})
         sujeto_assets[nombre] = {"span0": span0}
     lines += html_sujetos(sujetos, etiqueta)

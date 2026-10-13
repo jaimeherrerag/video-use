@@ -3,12 +3,13 @@
 
 Dos edits nuevos (2026-10-12), visibles y editables en Studio por la regla de oro:
 
-  sujeto  `ranges[i].sujeto = {"fondo": "#2e4a2a" | null, "fondo_hasta": [y0, y1]?, "src": [a, b]?}`:
+  sujeto  `ranges[i].sujeto = {"fondo": "#2e4a2a" | null, "fondo_hueco": {"elipse": [cx, cy, rx, ry,
+          nucleo], "piso": [y0, y1]}?, "fondo_hasta": [y0, y1]?, "src": [a, b]?}`:
           la persona recortada con
           `hyperframes remove-background` (webm VP9 con alfa) encima de su clip, para poner texto
           DETRAS de la cabeza (host de slot con data-z 3). Con `fondo`, un color liso tapa la camara;
-          `fondo_hasta` lo desvanece hacia abajo (px del lienzo) para que brazos y manos queden con la
-          imagen real, donde el recorte falla.
+          `fondo_hueco` deja ver la camara real en una elipse (manos y antebrazos, donde el recorte
+          falla) y en una franja inferior (escritorio); `fondo_hasta` solo desvanece hacia abajo.
           Es propiedad del clip, asi que sigue sus recortes y partidas en Studio. `src` (tiempo de la
           fuente) limita la ventana; sin `src` cubre el clip entero. Los recortes se cachean en
           <edit>/sujetos/ (minutos de CPU) con +-0.5 s de margen.
@@ -154,7 +155,22 @@ def html_sujetos(sujetos: list[dict], etq: Callable[[str], str]) -> list[str]:
         n, style = s["n"], f' style="{s["css"]}"' if s["css"] else ""
         if s["fondo"]:
             mascara = ""
-            if s.get("fondo_hasta"):              # [y0, y1]: solido hasta y0, transparente desde y1
+            hueco = s.get("fondo_hueco") or {}
+            if hueco:
+                # la camara real se ve en una elipse (manos y antebrazos, donde el recorte falla) y en una
+                # franja inferior (escritorio); el fondo queda en la interseccion de las dos mascaras
+                capas = []
+                if hueco.get("elipse"):
+                    cx, cy, rx, ry, nucleo = hueco["elipse"]
+                    capas.append(f"radial-gradient(ellipse {rx}px {ry}px at {cx}px {cy}px, "
+                                 f"transparent {nucleo * 100:.0f}%, #000 100%)")
+                if hueco.get("piso"):
+                    y0, y1 = hueco["piso"]
+                    capas.append(f"linear-gradient(to bottom, #000 {y0}px, transparent {y1}px)")
+                g = ", ".join(capas)
+                mascara = (f" -webkit-mask-image: {g}; -webkit-mask-composite: source-in;"
+                           f" mask-image: {g}; mask-composite: intersect;")
+            elif s.get("fondo_hasta"):            # [y0, y1]: solido hasta y0, transparente desde y1
                 y0, y1 = s["fondo_hasta"]
                 g = f"linear-gradient(to bottom, #000 {y0}px, transparent {y1}px)"
                 mascara = f" -webkit-mask-image: {g}; mask-image: {g};"
