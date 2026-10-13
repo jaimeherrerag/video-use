@@ -20,6 +20,8 @@ Studio antes del render final. Este proyecto (<edit>/studio/) es la mesa de trab
               de la cabeza), con fondo liso opcional (recorte_color.py)
   color       (shorts) `edl.color`: grade de cada clip y transiciones animadas (cortinilla,
               fundido, corte) como clips "Color" que se mueven en el timeline (recorte_color.py)
+  zoom        (shorts) `ranges[i].zoom`: push-in / pull-out animado de la camara del clip, con una
+              marca "Zoom" en el timeline (zooms_studio.py)
 
 Shorts y otros lienzos (desde 2026-10-08): `edl.studio.canvas` = {w, h} (default 1920x1080) y
 `edl.studio.proxy: false` usa copias a resolucion completa (GOP 6) en vez del proxy 540p: un
@@ -56,6 +58,7 @@ from geometria_studio import (W, H, css_de_place, fuente_a_lienzo, lienzo_a_fuen
 from mezcla_studio import clips_audio, leer_audio  # noqa: E402
 from recorte_color import (asset_sujeto, attr_grading, css_capas, html_color, html_sujetos,  # noqa: E402
                            js_transiciones, leer_color, leer_sujetos, plan_color, ventana_sujeto)
+from zooms_studio import CSS as CSS_ZOOM, JS as JS_ZOOM, html_zooms, leer_zooms  # noqa: E402
 from stitch_final import cargar_partes, medir_ganancia  # noqa: E402
 from studio_cuts import fmt_t, load_json, make_proxy, probe_wh, range_words, sha  # noqa: E402
 
@@ -200,7 +203,7 @@ def to_studio(edit: Path, force: bool) -> None:
         style = f' style="{css}"' if css else ""
         g = attr_grading(looks.get(fijos[i]) if fijos[i] else None)
         lines.append(
-            f'    <video id="c{i + 1:03d}" src="assets/{proxies[r["source"]]}" data-range="{i}"'
+            f'    <video id="c{i + 1:03d}" src="assets/{proxies[r["source"]]}" data-range="{i}" data-zclip="{i}"'
             f' data-source="{escape(r["source"])}" data-timeline-label="{escape(label)}"\n'
             f'      data-start="{t0:.3f}" data-duration="{d:.3f}" data-media-start="{r["start"]:.3f}"'
             f' data-has-audio="true" data-track-index="0"{g}{style} playsinline></video>')
@@ -263,6 +266,10 @@ def to_studio(edit: Path, force: bool) -> None:
                         "look": looks.get(lk) if lk else None})
         sujeto_assets[nombre] = {"span0": span0}
     lines += html_sujetos(sujetos, etiqueta)
+
+    # zooms animados (shorts): una marca por zoom en el timeline; escalan la camara de su clip
+    lineas_zoom, mapa_zoom = html_zooms(ventanas, etiqueta)
+    lines += lineas_zoom
 
     # slots HF (tarjetas, karaoke...): sus hosts en el timeline maestro
     mapa_slots = {}
@@ -331,7 +338,7 @@ def to_studio(edit: Path, force: bool) -> None:
     .scene-layer {{ position: absolute; top: 0; left: 0; width: {CW}px; height: {CH}px; z-index: 3; }}
     .blur-censura {{ z-index: 6; backdrop-filter: blur(16px); background: rgba(239, 68, 68, 0.10);
                     outline: 3px dashed rgba(239, 68, 68, 0.9); }}
-{css_capas(CW, CH) if (trans or sujetos) else ""}  </style>
+{css_capas(CW, CH) if (trans or sujetos) else ""}{CSS_ZOOM if mapa_zoom else ""}  </style>
 </head>
 <body>
   <!-- Generado por video-use/helpers/studio_maestro.py: el Studio UNICO del video (regla de oro).
@@ -344,7 +351,7 @@ def to_studio(edit: Path, force: bool) -> None:
   <script>
     const tl = gsap.timeline({{ paused: true }});
     tl.to({{}}, {{ duration: {total:.3f} }}, 0);
-{js_transiciones(CW, CH) if trans else ""}    window.__timelines["maestro"] = tl;
+{js_transiciones(CW, CH) if trans else ""}{JS_ZOOM if mapa_zoom else ""}    window.__timelines["maestro"] = tl;
   </script>
 </body>
 </html>
@@ -360,6 +367,7 @@ def to_studio(edit: Path, force: bool) -> None:
             "sujetos": {f"s{s['n']:03d}": {"range": s["i"], "start": s["t0"], "dur": s["dur"], "ms": s["ms"]}
                         for s in sujetos},
             "sujeto_assets": sujeto_assets,
+            "zooms": mapa_zoom,
             "comp_sha": {f.name: huella(f) for f in comps.glob("*.html")}}
     (out / "maestro_map.json").write_text(json.dumps(mapa, ensure_ascii=False, indent=2), encoding="utf-8")
     pkg = load_json(PRESET / "package.json")
@@ -369,6 +377,7 @@ def to_studio(edit: Path, force: bool) -> None:
     n_rf = sum(1 for r in edl["ranges"] if r.get("reframe"))
     print(f"studio maestro {CW}x{CH}: {len(edl['ranges'])} cortes ({n_rf} con encuadre), "
           f"{len(edl.get('broll') or [])} B-roll, {nb} blurs, {len(sujetos)} sujetos, {len(trans)} transiciones de color, "
+          f"{len(mapa_zoom)} zooms, "
           f"{len(mapa_slots)} sub-comps de slots, {len(mapa_ov)} overlays, "
           f"{len(mapa_audio['music']) if mapa_audio else 0} musica + {len(mapa_audio['sfx']) if mapa_audio else 0} SFX"
           f" | {fmt_t(total)} -> {index}")
@@ -396,7 +405,7 @@ def from_studio(edit: Path, dry: bool) -> None:
     orig_idx, clip_attrs = [], []                   # por range nuevo: su range original y su <video>
     for a in clips:
         orig = base_ranges[int(a["data-range"])]
-        r = {k: v for k, v in orig.items() if k not in ("censor", "sujeto")}
+        r = {k: v for k, v in orig.items() if k not in ("censor", "sujeto", "zoom")}
         ms, du = float(a.get("data-media-start", 0)), float(a["data-duration"])
         r["start"], r["end"] = round(ms, 3), round(ms + du, 3)
         sw, sh = dims[r["source"]]
@@ -439,6 +448,7 @@ def from_studio(edit: Path, dry: bool) -> None:
 
     # 1b) recorte de sujeto (sigue a su clip) y 1c) color (anclas de las transiciones + grade de cada clip)
     notas += leer_sujetos(p.el, ranges, orig_idx, base_ranges, mapa, oculto)
+    notas += leer_zooms(p.el, wins, ranges, orig_idx, base_ranges, mapa, oculto)
     color_nuevo, notas_color = leer_color(p.el, wins, clip_attrs, mapa, a_salida, oculto)
     notas += notas_color
 

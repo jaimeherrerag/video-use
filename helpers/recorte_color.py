@@ -231,7 +231,7 @@ def html_sujetos(sujetos: list[dict], etq: Callable[[str], str]) -> list[str]:
                 f' style="background: {s["fondo"]};{mascara}"></div>')
         lines.append(
             f'    <div id="sw{n:03d}" class="capa-sujeto">\n'
-            f'      <video id="s{n:03d}" src="assets/{s["asset"]}" data-sujeto="{s["i"]}"'
+            f'      <video id="s{n:03d}" src="assets/{s["asset"]}" data-sujeto="{s["i"]}" data-zclip="{s["i"]}"'
             f' data-timeline-label="{escape(etq(f"Sujeto {n} · recorte (clip {s["i"] + 1})"))}"\n'
             f'        data-start="{s["t0"]:.3f}" data-duration="{s["dur"]:.3f}" data-media-start="{s["ms"]:.3f}"'
             f' data-has-audio="false" data-track-index="{TRACK_SUJETO + n - 1}"{attr_grading(s["look"])}{style}'
@@ -315,6 +315,7 @@ def html_color(trans: list, looks: dict, asset_de: dict, css: list, etq: Callabl
             style = f' style="{css[c["i"]]}"' if css[c["i"]] else ""
             lines.append(
                 f'      <video id="cg{n:02d}{chr(97 + j)}" src="assets/{asset_de[c["source"]]}" data-color="{e["k"]}"'
+                f' data-zclip="{c["i"]}"'
                 f'{ancla} data-timeline-label="{escape(etq(label))}"\n'
                 f'        data-start="{c["start"]:.3f}" data-duration="{c["dur"]:.3f}" data-media-start="{c["ms"]:.3f}"'
                 f' data-has-audio="false" data-track-index="{TRACK_COLOR + n - 1}"{g}{style} muted playsinline></video>')
@@ -340,7 +341,7 @@ def css_capas(cw: int, ch: int) -> str:
     .cw-asa {{ position: absolute; top: {ch // 2 + 26}px; left: -31px; width: 68px; height: 68px; border-radius: 50%;
               background: #efe7d4; color: #1a1a17; display: flex; align-items: center; justify-content: center;
               font-family: Consolas, "Courier New", monospace; font-size: 30px; font-weight: 500; }}
-    .cw-pastilla {{ position: absolute; top: 96px; padding: 12px 22px; border-radius: 6px; background: #1a1a17;
+    .cw-pastilla {{ position: absolute; top: {330 if ch > cw else 96}px; padding: 12px 22px; border-radius: 6px; background: #1a1a17;
                    color: #efe7d4; font-family: Consolas, "Courier New", monospace; font-size: 26px;
                    font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; }}
     .cw-antes {{ left: 48px; }}
