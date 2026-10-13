@@ -94,7 +94,10 @@ def build_maestro(edit: Path, edl: dict, spec: dict, spec_path: Path, fps: int, 
     #    contra el video del maestro (visto 2026-10-08). Mismo fade de 30 ms por borde que render.py.
     d = stitch_dir / "voz"
     d.mkdir(parents=True, exist_ok=True)
-    sub = {k: v for k, v in edl.items() if k not in ("broll", "studio", "overlays")}
+    # sin lo que solo cambia la imagen (B-roll, color, recorte de sujeto): asi un cambio de color no
+    # rehace voz.wav ni regenera el karaoke
+    sub = {k: v for k, v in edl.items() if k not in ("broll", "studio", "overlays", "color")}
+    sub["ranges"] = [{k: v for k, v in r.items() if k != "sujeto"} for r in edl["ranges"]]
     sub["overlays"] = []
     txt = json.dumps(sub, ensure_ascii=False, indent=2)
     (d / "edl.json").write_text(txt, encoding="utf-8")

@@ -16,12 +16,17 @@ Studio antes del render final. Este proyecto (<edit>/studio/) es la mesa de trab
   audio       musica y SFX del stitch.json con su volumen relativo a la voz (mezcla_studio)
   B-roll      (shorts) `edl.broll`: clips de otra fuente encima de la camara, con su encuadre;
               se recortan, mueven y reencuadran igual que los cortes
+  sujeto      (shorts) `ranges[i].sujeto`: la persona recortada encima de su clip (texto detras
+              de la cabeza), con fondo liso opcional (recorte_color.py)
+  color       (shorts) `edl.color`: grade de cada clip y transiciones animadas (cortinilla,
+              fundido, corte) como clips "Color" que se mueven en el timeline (recorte_color.py)
 
 Shorts y otros lienzos (desde 2026-10-08): `edl.studio.canvas` = {w, h} (default 1920x1080) y
 `edl.studio.proxy: false` usa copias a resolucion completa (GOP 6) en vez del proxy 540p: un
 short es corto y el maestro se renderiza tal cual (`edl.studio.render: "maestro"`, build_final).
-Capas: z-index por CSS (fondo 0 < camara 1 < B-roll 2 < tarjetas 3 < ... ); un host de slot
-elige la suya con `data-z`.
+Capas: z-index por CSS (camara y color 1 < B-roll y fondo del sujeto 2 < tarjetas 3 < sujeto 4
+< cortinilla 5 < blur 6 < overlays 7); un host de slot elige la suya con `data-z` (texto detras
+de la cabeza: 3).
 
     to-studio   --edit-dir E [--force]   EDL + stitch.json + slots -> E/studio/
     from-studio --edit-dir E [--dry-run] Studio -> edl.json, stitch.json, slots (con respaldos)
@@ -49,6 +54,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from geometria_studio import (W, H, css_de_place, fuente_a_lienzo, lienzo_a_fuente,  # noqa: E402
                               place_de_css, place_de_reframe, rect_div, reframe_de_place)
 from mezcla_studio import clips_audio, leer_audio  # noqa: E402
+from recorte_color import (asset_sujeto, attr_grading, css_capas, html_color, html_sujetos,  # noqa: E402
+                           js_transiciones, leer_color, leer_sujetos, plan_color, ventana_sujeto)
 from stitch_final import cargar_partes, medir_ganancia  # noqa: E402
 from studio_cuts import fmt_t, load_json, make_proxy, probe_wh, range_words, sha  # noqa: E402
 
@@ -166,24 +173,41 @@ def to_studio(edit: Path, force: bool) -> None:
             asset_completo(sp, dst)
         proxies[key], dims[key] = dst.name, probe_wh(sp)
 
-    lines, t, cache = [], 0.0, {}
-    clip_win = []                                   # (t0, t1, place) por range, en Studio
-    for i, r in enumerate(edl["ranges"]):
+    # recorte de sujeto y color: solo en un maestro que se renderiza tal cual (render.py los ignora)
+    color = edl.get("color")
+    if (color or any(r.get("sujeto") for r in edl["ranges"])) and (con_proxy or st_cfg.get("render") != "maestro"):
+        sys.exit('`sujeto` y `color` solo funcionan con edl.studio.render = "maestro" y proxy: false (shorts)')
+
+    # ventana de cada clip en la salida, y el plan de color sobre ellas (cambios anclados en la fuente)
+    ventanas, t = [], 0.0
+    for r in edl["ranges"]:
         d = round(r["end"] - r["start"], 3)
+        ventanas.append((t, round(t + d, 3), r))
+        t = round(t + d, 3)
+    total = t
+    looks = (color or {}).get("looks") or {}
+    fijos, trans, look_en = plan_color(color, ventanas)
+
+    lines, cache = [], {}
+    clip_win, css_clip = [], []                     # (t0, t1, place) y el CSS de encuadre por range
+    for i, (t0, t1, r) in enumerate(ventanas):
+        d = round(t1 - t0, 3)
         sw, sh = dims[r["source"]]
         place = place_de_reframe(r.get("reframe"), sw, sh, CW, CH)
         css = css_de_place(place, sw, sh)
         text = range_words(edit / "transcripts", r["source"], r["start"], r["end"], cache) or r.get("beat", "")
         label = etiqueta(f"{i + 1} · {text}")
         style = f' style="{css}"' if css else ""
+        g = attr_grading(looks.get(fijos[i]) if fijos[i] else None)
         lines.append(
             f'    <video id="c{i + 1:03d}" src="assets/{proxies[r["source"]]}" data-range="{i}"'
             f' data-source="{escape(r["source"])}" data-timeline-label="{escape(label)}"\n'
-            f'      data-start="{t:.3f}" data-duration="{d:.3f}" data-media-start="{r["start"]:.3f}"'
-            f' data-has-audio="true" data-track-index="0"{style} playsinline></video>')
-        clip_win.append((t, t + d, place))
-        t = round(t + d, 3)
-    total = t
+            f'      data-start="{t0:.3f}" data-duration="{d:.3f}" data-media-start="{r["start"]:.3f}"'
+            f' data-has-audio="true" data-track-index="0"{g}{style} playsinline></video>')
+        clip_win.append((t0, t1, place))
+        css_clip.append(css)
+    # transiciones de color a mitad de clip: copias graduadas encima de la camara
+    lines += html_color(trans, looks, proxies, css_clip, etiqueta)
 
     # blurs: un rectangulo por censor y por range, en coordenadas del lienzo
     nb = 0
@@ -199,7 +223,9 @@ def to_studio(edit: Path, force: bool) -> None:
                 f'      style="position: absolute; left: {x:.1f}px; top: {y:.1f}px; width: {wd:.1f}px; '
                 f'height: {ht:.1f}px;"></div>')
 
-    # B-roll (shorts): clips de otra fuente encima de la camara, con su encuadre editable
+    # B-roll (shorts): clips de otra fuente encima de la camara, con su encuadre editable; si es de
+    # la propia camara (toma mala, PiP) lleva el look de color de su momento
+    fuentes_cam = {r["source"] for r in edl["ranges"]}
     for k, b in enumerate(edl.get("broll") or []):
         sw, sh = dims[b["source"]]
         css = css_de_place(place_de_reframe(b.get("reframe"), sw, sh, CW, CH), sw, sh)
@@ -210,7 +236,29 @@ def to_studio(edit: Path, force: bool) -> None:
             f' data-source="{escape(b["source"])}" data-timeline-label="{escape(label)}"\n'
             f'      data-start="{b["at"]:.3f}" data-duration="{b["end"] - b["start"]:.3f}"'
             f' data-media-start="{b["start"]:.3f}" data-has-audio="false" data-track-index="1"'
+            f'{attr_grading(looks.get(look_en(b["at"])) if b["source"] in fuentes_cam and look_en(b["at"]) else None)}'
             f'{style} muted playsinline></video>')
+
+    # recorte de sujeto (shorts): la persona encima de su clip, con el look de color de su inicio
+    sujetos, sujeto_assets = [], {}
+    for i, (t0, t1, r) in enumerate(ventanas):
+        w = ventana_sujeto(r)
+        if not w:
+            if r.get("sujeto"):
+                print(f"  aviso: el sujeto del clip {i + 1} queda fuera del clip -> no se emite")
+            continue
+        a, b = w
+        nombre, span0 = asset_sujeto(edit, assets / proxies[r["source"]], a, b, assets)
+        st0, du = round(t0 + a - r["start"], 3), round(b - a, 3)
+        if any(e["T"] < st0 + du and e["T"] + e["dur"] > st0 for e in trans):
+            print(f"  aviso: el recorte del clip {i + 1} se cruza con una transicion de color: "
+                  "queda con el look de su inicio (acotarlo con sujeto.src)")
+        lk = look_en(st0)
+        sujetos.append({"n": len(sujetos) + 1, "i": i, "t0": st0, "dur": du, "ms": round(a - span0, 3),
+                        "asset": nombre, "fondo": r["sujeto"].get("fondo"), "css": css_clip[i],
+                        "look": looks.get(lk) if lk else None})
+        sujeto_assets[nombre] = {"span0": span0}
+    lines += html_sujetos(sujetos, etiqueta)
 
     # slots HF (tarjetas, karaoke...): sus hosts en el timeline maestro
     mapa_slots = {}
@@ -279,7 +327,7 @@ def to_studio(edit: Path, force: bool) -> None:
     .scene-layer {{ position: absolute; top: 0; left: 0; width: {CW}px; height: {CH}px; z-index: 3; }}
     .blur-censura {{ z-index: 6; backdrop-filter: blur(16px); background: rgba(239, 68, 68, 0.10);
                     outline: 3px dashed rgba(239, 68, 68, 0.9); }}
-  </style>
+{css_capas(CW, CH) if (trans or sujetos) else ""}  </style>
 </head>
 <body>
   <!-- Generado por video-use/helpers/studio_maestro.py: el Studio UNICO del video (regla de oro).
@@ -292,7 +340,7 @@ def to_studio(edit: Path, force: bool) -> None:
   <script>
     const tl = gsap.timeline({{ paused: true }});
     tl.to({{}}, {{ duration: {total:.3f} }}, 0);
-    window.__timelines["maestro"] = tl;
+{js_transiciones(CW, CH) if trans else ""}    window.__timelines["maestro"] = tl;
   </script>
 </body>
 </html>
@@ -302,6 +350,12 @@ def to_studio(edit: Path, force: bool) -> None:
     mapa = {"ranges": edl["ranges"], "dims": dims, "slots": mapa_slots, "overlays": mapa_ov,
             "audio": mapa_audio, "total": total, "canvas": {"w": CW, "h": CH},
             "broll": edl.get("broll") or [],
+            "color": color,
+            "el_color": {f"cg{n:02d}a": {"start": e["copias"][0]["start"], "source": e["copias"][0]["source"],
+                                          "k": e["k"]} for n, e in enumerate(trans, 1)},
+            "sujetos": {f"s{s['n']:03d}": {"range": s["i"], "start": s["t0"], "dur": s["dur"], "ms": s["ms"]}
+                        for s in sujetos},
+            "sujeto_assets": sujeto_assets,
             "comp_sha": {f.name: huella(f) for f in comps.glob("*.html")}}
     (out / "maestro_map.json").write_text(json.dumps(mapa, ensure_ascii=False, indent=2), encoding="utf-8")
     pkg = load_json(PRESET / "package.json")
@@ -310,7 +364,7 @@ def to_studio(edit: Path, force: bool) -> None:
     shutil.copy(PRESET / "hyperframes.json", out / "hyperframes.json")
     n_rf = sum(1 for r in edl["ranges"] if r.get("reframe"))
     print(f"studio maestro {CW}x{CH}: {len(edl['ranges'])} cortes ({n_rf} con encuadre), "
-          f"{len(edl.get('broll') or [])} B-roll, {nb} blurs, "
+          f"{len(edl.get('broll') or [])} B-roll, {nb} blurs, {len(sujetos)} sujetos, {len(trans)} transiciones de color, "
           f"{len(mapa_slots)} sub-comps de slots, {len(mapa_ov)} overlays, "
           f"{len(mapa_audio['music']) if mapa_audio else 0} musica + {len(mapa_audio['sfx']) if mapa_audio else 0} SFX"
           f" | {fmt_t(total)} -> {index}")
@@ -335,9 +389,10 @@ def from_studio(edit: Path, dry: bool) -> None:
             clips.append(a)
     clips.sort(key=lambda a: (float(a.get("data-start", 0)), a["_order"]))
     ranges, wins, notas, t_out = [], [], [], 0.0
+    orig_idx, clip_attrs = [], []                   # por range nuevo: su range original y su <video>
     for a in clips:
         orig = base_ranges[int(a["data-range"])]
-        r = {k: v for k, v in orig.items() if k not in ("censor",)}
+        r = {k: v for k, v in orig.items() if k not in ("censor", "sujeto")}
         ms, du = float(a.get("data-media-start", 0)), float(a["data-duration"])
         r["start"], r["end"] = round(ms, 3), round(ms + du, 3)
         sw, sh = dims[r["source"]]
@@ -367,6 +422,8 @@ def from_studio(edit: Path, dry: bool) -> None:
         st = float(a.get("data-start", 0))
         wins.append((st, st + du, t_out, place, r))
         ranges.append(r)
+        orig_idx.append(int(a["data-range"]))
+        clip_attrs.append(a)
         t_out += du
 
     def a_salida(ts: float) -> float:
@@ -375,6 +432,11 @@ def from_studio(edit: Path, dry: bool) -> None:
             if ts < s1:
                 return o0 + max(0.0, ts - s0)
         return t_out
+
+    # 1b) recorte de sujeto (sigue a su clip) y 1c) color (anclas de las transiciones + grade de cada clip)
+    notas += leer_sujetos(p.el, ranges, orig_idx, base_ranges, mapa, oculto)
+    color_nuevo, notas_color = leer_color(p.el, wins, clip_attrs, mapa, a_salida, oculto)
+    notas += notas_color
 
     # 2) blurs -> censor de cada range que tocan
     for tag, a in p.el:
@@ -500,6 +562,8 @@ def from_studio(edit: Path, dry: bool) -> None:
     edl["ranges"], edl["overlays"] = ranges, overlays
     if base_broll or broll:
         edl["broll"] = broll
+    if color_nuevo is not None:
+        edl["color"] = color_nuevo
     (edit / "edl.json").write_text(json.dumps(edl, ensure_ascii=False, indent=2), encoding="utf-8")
     # composiciones editadas en Studio -> de vuelta a su slot / overlay
     for sdir, hs in cambios_slot.items():
