@@ -3,9 +3,12 @@
 
 Dos edits nuevos (2026-10-12), visibles y editables en Studio por la regla de oro:
 
-  sujeto  `ranges[i].sujeto = {"fondo": "#2e4a2a" | null, "src": [a, b]?}`: la persona recortada con
+  sujeto  `ranges[i].sujeto = {"fondo": "#2e4a2a" | null, "fondo_hasta": [y0, y1]?, "src": [a, b]?}`:
+          la persona recortada con
           `hyperframes remove-background` (webm VP9 con alfa) encima de su clip, para poner texto
-          DETRAS de la cabeza (host de slot con data-z 3). Con `fondo`, un color liso tapa la camara.
+          DETRAS de la cabeza (host de slot con data-z 3). Con `fondo`, un color liso tapa la camara;
+          `fondo_hasta` lo desvanece hacia abajo (px del lienzo) para que brazos y manos queden con la
+          imagen real, donde el recorte falla.
           Es propiedad del clip, asi que sigue sus recortes y partidas en Studio. `src` (tiempo de la
           fuente) limita la ventana; sin `src` cubre el clip entero. Los recortes se cachean en
           <edit>/sujetos/ (minutos de CPU) con +-0.5 s de margen.
@@ -39,6 +42,7 @@ from typing import Callable
 HF = "0.8.140"
 FPS = 30
 MARGEN = 0.5                       # s de fuente de mas a cada lado del recorte (recortes en Studio)
+MASCARA = 2                        # version del post-proceso del borde (_limpiar_mascara)
 TRACK_FONDO, TRACK_SUJETO, TRACK_COLOR = 19, 20, 30
 # cortinilla diagonal: la zona "despues" entra desde la derecha; el borde va inclinado 20% del ancho
 POLY_INI = "polygon(120% 0%, 140% 0%, 140% 100%, 100% 100%)"
@@ -61,46 +65,76 @@ def _copiar(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _tramo(full: Path, s0: float, s1: float, dst: Path) -> None:
+    """El tramo [s0, s1] de la fuente del maestro, cuadro por cuadro (entrada de remove-background y
+    color del recorte)."""
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{s0:.3f}", "-i", str(full), "-t", f"{s1 - s0:.3f}",
+                    "-an", "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-g", "6", "-r", str(FPS),
+                    str(dst)], check=True)
+
+
+def _limpiar_mascara(tramo: Path, crudo: Path, dst: Path) -> None:
+    """Borde firme (version MASCARA): el alfa de u2net se cierra ~2 px hacia adentro, la franja
+    semitransparente se reduce (25-75% -> 0-100%) y se suaviza 0.7 px, y el color es el EXACTO de la
+    camara (el del tramo, no el del webm). Sin esto, en el Studio de Jaime se veia una linea blanca de
+    ~3 px alrededor del recorte graduado y un halo lila sobre el fondo liso (2026-10-12)."""
+    fc = ("[1:v]alphaextract,erosion,erosion,lut=c0='clip((val-64)*2,0,255)',gblur=sigma=0.7[a];"
+          "[0:v][a]alphamerge,format=yuva420p[v]")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(tramo), "-c:v", "libvpx-vp9", "-i", str(crudo),
+                    "-filter_complex", fc, "-map", "[v]", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+                    "-crf", "18", "-b:v", "0", "-deadline", "good", "-cpu-used", "4", "-row-mt", "1",
+                    "-g", "1", "-auto-alt-ref", "0", str(dst)], check=True)
+
+
 def asset_sujeto(edit: Path, full: Path, a: float, b: float, assets: Path) -> tuple[str, float]:
     """Recorte (webm con alfa) que cubre [a, b] de la fuente `full` (la misma copia que usa la camara
     del maestro, asi los cuadros coinciden). Reusa uno de la cache si su tramo lo contiene; si no,
-    genera [a - 0.5, b + 0.5] alineado a cuadros. Devuelve (archivo en assets/, inicio del tramo)."""
+    genera [a - 0.5, b + 0.5] alineado a cuadros. En la cache quedan el crudo de remove-background
+    (lo caro) y su version con el borde limpio (`_m<MASCARA>`), que es la que va a Studio.
+    Devuelve (archivo en assets/, inicio del tramo)."""
     cache = edit / "sujetos"
     cache.mkdir(exist_ok=True)
     idx_p = cache / "indice.json"
     idx = json.loads(idx_p.read_text(encoding="utf-8")) if idx_p.exists() else {}
     st = full.stat()
     firma = {"size": st.st_size, "mtime": int(st.st_mtime)}
+    crudo = s0 = s1 = None
     for nombre, info in sorted(idx.items()):
-        s0, s1 = info["span"]
-        if (info["fuente"] == full.name and info["firma"] == firma and s0 <= a + 1e-3 and b <= s1 + 1e-3
+        c0, c1 = info["span"]
+        if (info["fuente"] == full.name and info["firma"] == firma and c0 <= a + 1e-3 and b <= c1 + 1e-3
                 and (cache / nombre).exists()):
-            _copiar(cache / nombre, assets / nombre)
-            return nombre, s0
-    s0 = max(0.0, math.floor((a - MARGEN) * FPS) / FPS)
-    s1 = math.ceil((b + MARGEN) * FPS) / FPS
-    h = hashlib.sha1(f"{full.name}|{firma}|{s0:.3f}|{s1:.3f}|best|{HF}".encode()).hexdigest()[:8]
-    nombre, tramo = f"sujeto_{h}.webm", cache / f"_tramo_{h}.mp4"
-    print(f"  recorte de sujeto: {full.name} {s0:.2f}-{s1:.2f} s "
-          f"(remove-background en CPU, ~{(s1 - s0) * FPS * 0.3:.0f} s)...", flush=True)
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{s0:.3f}", "-i", str(full), "-t", f"{s1 - s0:.3f}",
-                    "-an", "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-g", "6", "-r", str(FPS),
-                    str(tramo)], check=True)
-    npx = ["cmd", "/c", "npx"] if sys.platform == "win32" else ["npx"]
-    # su spinner llena la consola: se captura y solo se muestra la ultima linea (o todo si falla)
-    rb = subprocess.run(npx + ["--yes", f"hyperframes@{HF}", "remove-background", str(tramo),
-                               "-o", str(cache / nombre), "--quality", "best"],
-                        capture_output=True, text=True, encoding="utf-8", errors="replace")
-    salida = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "\n", (rb.stdout or "") + (rb.stderr or ""))
-    lineas = [x.strip(" │◇◒◐◓◑") for x in salida.splitlines() if x.strip(" │◇◒◐◓◑")]
-    if rb.returncode != 0 or not (cache / nombre).exists():
-        sys.exit("remove-background fallo:\n" + "\n".join(lineas[-15:]))
-    print("   ", next((x for x in reversed(lineas) if "Removed background" in x), lineas[-1] if lineas else "ok"))
-    tramo.unlink(missing_ok=True)
-    idx[nombre] = {"fuente": full.name, "firma": firma, "span": [round(s0, 3), round(s1, 3)]}
-    idx_p.write_text(json.dumps(idx, indent=2), encoding="utf-8")
-    _copiar(cache / nombre, assets / nombre)
-    return nombre, s0
+            crudo, s0, s1 = cache / nombre, c0, c1
+            break
+    if crudo is None:
+        s0 = max(0.0, math.floor((a - MARGEN) * FPS) / FPS)
+        s1 = math.ceil((b + MARGEN) * FPS) / FPS
+        h = hashlib.sha1(f"{full.name}|{firma}|{s0:.3f}|{s1:.3f}|best|{HF}".encode()).hexdigest()[:8]
+        crudo, tramo = cache / f"sujeto_{h}.webm", cache / f"_tramo_{h}.mp4"
+        print(f"  recorte de sujeto: {full.name} {s0:.2f}-{s1:.2f} s "
+              f"(remove-background en CPU, ~{(s1 - s0) * FPS * 0.3:.0f} s)...", flush=True)
+        _tramo(full, s0, s1, tramo)
+        npx = ["cmd", "/c", "npx"] if sys.platform == "win32" else ["npx"]
+        # su spinner llena la consola: se captura y solo se muestra la ultima linea (o todo si falla)
+        rb = subprocess.run(npx + ["--yes", f"hyperframes@{HF}", "remove-background", str(tramo),
+                                   "-o", str(crudo), "--quality", "best"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        salida = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "\n", (rb.stdout or "") + (rb.stderr or ""))
+        lineas = [x.strip(" │◇◒◐◓◑") for x in salida.splitlines() if x.strip(" │◇◒◐◓◑")]
+        if rb.returncode != 0 or not crudo.exists():
+            sys.exit("remove-background fallo:\n" + "\n".join(lineas[-15:]))
+        print("   ", next((x for x in reversed(lineas) if "Removed background" in x), lineas[-1] if lineas else "ok"))
+        idx[crudo.name] = {"fuente": full.name, "firma": firma, "span": [round(s0, 3), round(s1, 3)]}
+        idx_p.write_text(json.dumps(idx, indent=2), encoding="utf-8")
+    limpio = crudo.with_name(f"{crudo.stem}_m{MASCARA}.webm")
+    if not limpio.exists():
+        print(f"  borde del recorte: {limpio.name}", flush=True)
+        tramo = cache / f"_tramo_{crudo.stem}.mp4"
+        if not tramo.exists():
+            _tramo(full, s0, s1, tramo)
+        _limpiar_mascara(tramo, crudo, limpio)
+        tramo.unlink(missing_ok=True)
+    _copiar(limpio, assets / limpio.name)
+    return limpio.name, s0
 
 
 def ventana_sujeto(r: dict) -> tuple[float, float] | None:
@@ -119,11 +153,16 @@ def html_sujetos(sujetos: list[dict], etq: Callable[[str], str]) -> list[str]:
     for s in sujetos:
         n, style = s["n"], f' style="{s["css"]}"' if s["css"] else ""
         if s["fondo"]:
+            mascara = ""
+            if s.get("fondo_hasta"):              # [y0, y1]: solido hasta y0, transparente desde y1
+                y0, y1 = s["fondo_hasta"]
+                g = f"linear-gradient(to bottom, #000 {y0}px, transparent {y1}px)"
+                mascara = f" -webkit-mask-image: {g}; mask-image: {g};"
             lines.append(
                 f'    <div id="fs{n:03d}" class="clip fondo-sujeto" data-sujeto="{s["i"]}"'
                 f' data-timeline-label="{escape(etq(f"Fondo sujeto {n}"))}"\n'
                 f'      data-start="{s["t0"]:.3f}" data-duration="{s["dur"]:.3f}" data-track-index="{TRACK_FONDO}"'
-                f' style="background: {s["fondo"]};"></div>')
+                f' style="background: {s["fondo"]};{mascara}"></div>')
         lines.append(
             f'    <div id="sw{n:03d}" class="capa-sujeto">\n'
             f'      <video id="s{n:03d}" src="assets/{s["asset"]}" data-sujeto="{s["i"]}"'
@@ -314,7 +353,7 @@ def leer_sujetos(el: list, ranges: list, orig_idx: list, base_ranges: list, mapa
         if all(v[2] for v in vs) and orig:
             s = dict(orig)
         else:
-            s = {"fondo": None}
+            s = {k: v for k, v in (orig or {"fondo": None}).items() if k != "src"}
             if a0 > r["start"] + 0.02 or b0 < r["end"] - 0.02:
                 s["src"] = [round(a0, 3), round(b0, 3)]
             notas.append(f"  clip {k + 1}: recorte de sujeto {s.get('src', 'clip entero')}")
