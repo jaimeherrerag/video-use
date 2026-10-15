@@ -150,8 +150,21 @@ def pills_de_frases(transcript_path: Path, ranges: list[tuple[float, float]], fr
         off += e - s
     toks = [w["tok"] for w in words]
     pills, faltan = [], []
+    n_link = 0
     for frase in frases:
-        ft = [t for t in (_norm(x) for x in frase.split()) if t]
+        # [[...]] marca un wikilink (plantilla de Obsidian): no cuenta para buscar la frase, pero
+        # sus words salen con data-wl="<n>" para que la plantilla las agrupe y resalte
+        ft, links, dentro = [], [], None
+        for x in frase.split():
+            if x.startswith("[["):
+                n_link += 1
+                dentro = n_link
+            t = _norm(x)
+            if t:
+                ft.append(t)
+                links.append(dentro)
+            if "]]" in x:
+                dentro = None
         hit = next((i for i in range(len(toks) - len(ft) + 1) if toks[i:i + len(ft)] == ft), None)
         if hit is None:
             faltan.append(frase)
@@ -162,7 +175,8 @@ def pills_de_frases(transcript_path: Path, ranges: list[tuple[float, float]], fr
             pills.append({
                 "show_at": round(max(0.0, trozo[0]["at"] - 0.05), 3),
                 "hide_at": round(min(off, trozo[-1]["end"] + 0.35), 3),
-                "words": [{"text": w["text"], "at": round(max(0.0, w["at"]), 3)} for w in trozo],
+                "words": [{"text": w["text"], "at": round(max(0.0, w["at"]), 3), "link": links[k + j]}
+                          for j, w in enumerate(trozo)],
             })
     pills.sort(key=lambda p: p["show_at"])
     for i, p in enumerate(pills, start=1):
@@ -181,7 +195,9 @@ def render_pills_html(pills: list[dict]) -> str:
     parts = []
     for p in pills:
         word_spans = "\n        ".join(
-            f'<span class="kar-w" data-at="{w["at"]:.2f}">{w["text"]}</span>'
+            f'<span class="kar-w" data-at="{w["at"]:.2f}"'
+            + (f' data-wl="{w["link"]}"' if w.get("link") else "")
+            + f'>{w["text"]}</span>'
             for w in p["words"]
         )
         parts.append(
