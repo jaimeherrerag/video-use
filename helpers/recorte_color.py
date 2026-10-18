@@ -50,6 +50,16 @@ POLY_INI = "polygon(120% 0%, 140% 0%, 140% 100%, 100% 100%)"
 POLY_FIN = "polygon(0% 0%, 140% 0%, 140% 100%, -20% 100%)"
 
 
+MONO = ("mono", "bw", "blanco-y-negro")
+
+
+def es_mono(look) -> bool:
+    """Look blanco y negro: el unico que el render de los largos (render.py, ffmpeg) sabe aplicar."""
+    if not isinstance(look, dict):
+        return False
+    return any(str(look.get("preset", "")).lower().startswith(m) for m in MONO)
+
+
 def look_json(look) -> str:
     """JSON canonico de un grading: misma salida siempre (idempotencia de to-studio)."""
     return json.dumps(look, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -66,11 +76,12 @@ def _copiar(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def _tramo(full: Path, s0: float, s1: float, dst: Path) -> None:
+def _tramo(full: Path, s0: float, s1: float, dst: Path, ancho: int | None = None) -> None:
     """El tramo [s0, s1] de la fuente del maestro, cuadro por cuadro (entrada de remove-background y
-    color del recorte)."""
+    color del recorte). Con `ancho` se reduce (largos: fuente 4K -> 1920, ~16x mas rapido que en 4K)."""
+    vf = ["-vf", f"scale={ancho}:-2:flags=lanczos"] if ancho else []
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{s0:.3f}", "-i", str(full), "-t", f"{s1 - s0:.3f}",
-                    "-an", "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-g", "6", "-r", str(FPS),
+                    "-an", *vf, "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-g", "6", "-r", str(FPS),
                     str(dst)], check=True)
 
 
@@ -137,7 +148,7 @@ def _limpiar_mascara(tramo: Path, crudo: Path, dst: Path, relleno: bool = True) 
 
 
 def asset_sujeto(edit: Path, full: Path, a: float, b: float, assets: Path,
-                 relleno: bool = True) -> tuple[str, float]:
+                 relleno: bool = True, ancho: int | None = None) -> tuple[str, float]:
     """Recorte (webm con alfa) que cubre [a, b] de la fuente `full` (la misma copia que usa la camara
     del maestro, asi los cuadros coinciden). Reusa uno de la cache si su tramo lo contiene; si no,
     genera [a - 0.5, b + 0.5] alineado a cuadros. En la cache quedan el crudo de remove-background
@@ -153,17 +164,17 @@ def asset_sujeto(edit: Path, full: Path, a: float, b: float, assets: Path,
     for nombre, info in sorted(idx.items()):
         c0, c1 = info["span"]
         if (info["fuente"] == full.name and info["firma"] == firma and c0 <= a + 1e-3 and b <= c1 + 1e-3
-                and (cache / nombre).exists()):
+                and info.get("ancho") == ancho and (cache / nombre).exists()):
             crudo, s0, s1 = cache / nombre, c0, c1
             break
     if crudo is None:
         s0 = max(0.0, math.floor((a - MARGEN) * FPS) / FPS)
         s1 = math.ceil((b + MARGEN) * FPS) / FPS
-        h = hashlib.sha1(f"{full.name}|{firma}|{s0:.3f}|{s1:.3f}|best|{HF}".encode()).hexdigest()[:8]
+        h = hashlib.sha1(f"{full.name}|{firma}|{s0:.3f}|{s1:.3f}|best|{HF}{f'|w{ancho}' if ancho else ''}".encode()).hexdigest()[:8]
         crudo, tramo = cache / f"sujeto_{h}.webm", cache / f"_tramo_{h}.mp4"
         print(f"  recorte de sujeto: {full.name} {s0:.2f}-{s1:.2f} s "
               f"(remove-background en CPU, ~{(s1 - s0) * FPS * 0.3:.0f} s)...", flush=True)
-        _tramo(full, s0, s1, tramo)
+        _tramo(full, s0, s1, tramo, ancho)
         npx = ["cmd", "/c", "npx"] if sys.platform == "win32" else ["npx"]
         # su spinner llena la consola: se captura y solo se muestra la ultima linea (o todo si falla)
         rb = subprocess.run(npx + ["--yes", f"hyperframes@{HF}", "remove-background", str(tramo),
@@ -174,14 +185,14 @@ def asset_sujeto(edit: Path, full: Path, a: float, b: float, assets: Path,
         if rb.returncode != 0 or not crudo.exists():
             sys.exit("remove-background fallo:\n" + "\n".join(lineas[-15:]))
         print("   ", next((x for x in reversed(lineas) if "Removed background" in x), lineas[-1] if lineas else "ok"))
-        idx[crudo.name] = {"fuente": full.name, "firma": firma, "span": [round(s0, 3), round(s1, 3)]}
+        idx[crudo.name] = {"fuente": full.name, "firma": firma, "span": [round(s0, 3), round(s1, 3)], "ancho": ancho}
         idx_p.write_text(json.dumps(idx, indent=2), encoding="utf-8")
     limpio = crudo.with_name(f"{crudo.stem}_m{MASCARA}{'' if relleno else 'c'}.webm")
     if not limpio.exists():
         print(f"  borde del recorte: {limpio.name}", flush=True)
         tramo = cache / f"_tramo_{crudo.stem}.mp4"
         if not tramo.exists():
-            _tramo(full, s0, s1, tramo)
+            _tramo(full, s0, s1, tramo, ancho)
         _limpiar_mascara(tramo, crudo, limpio, relleno)
         tramo.unlink(missing_ok=True)
     _copiar(limpio, assets / limpio.name)
@@ -198,12 +209,19 @@ def ventana_sujeto(r: dict) -> tuple[float, float] | None:
     return (a, b) if b - a >= 0.05 else None
 
 
+def fondo_css(s: dict) -> str:
+    """Color liso o imagen (cubre el lienzo) detras del recorte."""
+    if s.get("fondo_img"):
+        return f"url('assets/{Path(s['fondo_img']).name}') center / cover no-repeat"
+    return s["fondo"]
+
+
 def html_sujetos(sujetos: list[dict], etq: Callable[[str], str]) -> list[str]:
     """sujetos: [{n, i, t0, dur, ms, asset, fondo, css, look}] -> fondo liso (z2) + recorte (z4)."""
     lines = []
     for s in sujetos:
         n, style = s["n"], f' style="{s["css"]}"' if s["css"] else ""
-        if s["fondo"]:
+        if s["fondo"] or s.get("fondo_img"):
             mascara = ""
             hueco = s.get("fondo_hueco") or {}
             if hueco:
@@ -228,7 +246,7 @@ def html_sujetos(sujetos: list[dict], etq: Callable[[str], str]) -> list[str]:
                 f'    <div id="fs{n:03d}" class="clip fondo-sujeto" data-sujeto="{s["i"]}"'
                 f' data-timeline-label="{escape(etq(f"Fondo sujeto {n}"))}"\n'
                 f'      data-start="{s["t0"]:.3f}" data-duration="{s["dur"]:.3f}" data-track-index="{TRACK_FONDO}"'
-                f' style="background: {s["fondo"]};{mascara}"></div>')
+                f' style="background: {fondo_css(s)};{mascara}"></div>')
         lines.append(
             f'    <div id="sw{n:03d}" class="capa-sujeto">\n'
             f'      <video id="s{n:03d}" src="assets/{s["asset"]}" data-sujeto="{s["i"]}" data-zclip="{s["i"]}"'
@@ -385,7 +403,9 @@ def leer_sujetos(el: list, ranges: list, orig_idx: list, base_ranges: list, mapa
     for tag, a in el:
         if "fondo-sujeto" in (a.get("class") or "") and not oculto(a):
             m = re.search(r"background(?:-color)?:\s*([^;]+)", a.get("style", ""))
-            fondos[int(a["data-sujeto"])] = m.group(1).strip() if m else None
+            v = m.group(1).strip() if m else None
+            u = re.search(r"url\(['\"]?([^'\")]+)", v or "")
+            fondos[int(a["data-sujeto"])] = ("img", Path(u.group(1)).name) if u else v
     for tag, a in el:
         if tag != "video" or "data-sujeto" not in a or oculto(a):
             continue
@@ -425,9 +445,17 @@ def leer_sujetos(el: list, ranges: list, orig_idx: list, base_ranges: list, mapa
                 s["src"] = [round(a0, 3), round(b0, 3)]
             notas.append(f"  clip {k + 1}: recorte de sujeto {s.get('src', 'clip entero')}")
         fondo = fondos.get(i)
-        if (fondo or None) != (s.get("fondo") or None):
-            notas.append(f"  clip {k + 1}: fondo del sujeto {s.get('fondo')} -> {fondo}")
-        s["fondo"] = fondo
+        if isinstance(fondo, tuple):                # imagen: se queda la ruta del EDL si es el mismo archivo
+            img0 = s.get("fondo_img")
+            if not img0 or Path(img0).name != fondo[1]:
+                notas.append(f"  clip {k + 1}: fondo del sujeto -> imagen {fondo[1]}")
+                s["fondo_img"] = img0 if img0 and Path(img0).name == fondo[1] else fondo[1]
+            s["fondo"] = None
+        else:
+            if (fondo or None) != (s.get("fondo") or None) or s.get("fondo_img"):
+                notas.append(f"  clip {k + 1}: fondo del sujeto {s.get('fondo') or s.get('fondo_img')} -> {fondo}")
+            s["fondo"] = fondo
+            s.pop("fondo_img", None)
         if len(vs) > 1:
             notas.append(f"  clip {k + 1}: recorte partido en {len(vs)} -> se usa la envolvente")
         r["sujeto"] = s

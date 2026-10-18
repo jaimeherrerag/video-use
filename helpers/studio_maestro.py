@@ -56,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from geometria_studio import (W, H, css_de_place, fuente_a_lienzo, lienzo_a_fuente,  # noqa: E402
                               place_de_css, place_de_reframe, rect_div, reframe_de_place)
 from mezcla_studio import clips_audio, leer_audio  # noqa: E402
-from recorte_color import (asset_sujeto, attr_grading, css_capas, html_color, html_sujetos,  # noqa: E402
+from recorte_color import (asset_sujeto, attr_grading, es_mono, css_capas, html_color, html_sujetos,  # noqa: E402
                            js_transiciones, leer_color, leer_sujetos, plan_color, ventana_sujeto)
 from zooms_studio import CSS as CSS_ZOOM, JS as JS_ZOOM, html_zooms, leer_zooms  # noqa: E402
 from stitch_final import cargar_partes, medir_ganancia  # noqa: E402
@@ -110,6 +110,15 @@ def editada_en_studio(f: Path, mapa: dict, otra: Path) -> bool:
     return huella(f) != h0
 
 
+def renombrar_comp(txt: str, viejo: str, nuevo: str) -> str:
+    """Cambia el id de composicion de una sub-composicion (template, root, CSS del root y timeline)."""
+    v = re.escape(viejo)
+    txt = re.sub(rf'id="{v}-template"', f'id="{nuevo}-template"', txt)
+    txt = re.sub(rf'(id|data-composition-id)="{v}"', rf'\g<1>="{nuevo}"', txt)
+    txt = re.sub(rf"#{v}(?=[\s{{.:,>\[])", f"#{nuevo}", txt)
+    return re.sub(rf"""__timelines\[(["']){v}\1\]""", f'__timelines["{nuevo}"]', txt)
+
+
 def etiqueta(texto: str) -> str:
     """Texto de data-timeline-label, recortado y SIN < ni >: Studio reescribe el archivo con esos
     caracteres sin escapar y el parser de tiempos de HyperFrames corta el tag en el ">" (visto
@@ -161,9 +170,10 @@ def to_studio(edit: Path, force: bool) -> None:
 
     # medios: proxy 540p (long-form; se reutiliza el de la revision de cortes si existe) o copia a
     # resolucion completa (shorts), y tamano real de cada fuente
-    proxies, dims = {}, {}
+    proxies, dims, fuentes = {}, {}, {}
     for key, src in edl["sources"].items():
         sp = Path(src) if Path(src).is_absolute() else (edit / src).resolve()
+        fuentes[key] = sp
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in key)
         if con_proxy:
             dst = assets / f"proxy_{safe}.mp4"
@@ -176,10 +186,16 @@ def to_studio(edit: Path, force: bool) -> None:
             asset_completo(sp, dst)
         proxies[key], dims[key] = dst.name, probe_wh(sp)
 
-    # recorte de sujeto y color: solo en un maestro que se renderiza tal cual (render.py los ignora)
+    # recorte de sujeto y color: en un maestro que se renderiza tal cual (shorts) va todo; en los largos
+    # (proxy + render.py por tramos, 2026-10-18) render.py compone el recorte y aplica solo el look
+    # blanco y negro, asi que cualquier otro look se rechaza aqui en vez de perderse en el render
     color = edl.get("color")
-    if (color or any(r.get("sujeto") for r in edl["ranges"])) and (con_proxy or st_cfg.get("render") != "maestro"):
-        sys.exit('`sujeto` y `color` solo funcionan con edl.studio.render = "maestro" y proxy: false (shorts)')
+    largo = con_proxy or st_cfg.get("render") != "maestro"
+    if color and largo:
+        otros = [n for n, lk in (color.get("looks") or {}).items() if not es_mono(lk)]
+        if otros:
+            sys.exit(f"edl.color: en un largo render.py solo aplica looks blanco y negro (preset mono*); "
+                     f"no sabe hacer: {', '.join(otros)}")
 
     # ventana de cada clip en la salida, y el plan de color sobre ellas (cambios anclados en la fuente)
     ventanas, t = [], 0.0
@@ -252,15 +268,24 @@ def to_studio(edit: Path, force: bool) -> None:
             continue
         a, b = w
         # sobre un fondo liso el borde lleva el color del sujeto; sobre la camara real, el de la camara
-        nombre, span0 = asset_sujeto(edit, assets / proxies[r["source"]], a, b, assets,
-                                     relleno=bool(r["sujeto"].get("fondo")))
+        # largos: el recorte sale de la fuente ORIGINAL bajada al ancho del lienzo (el proxy de 540p
+        # no sirve para el render) y es el mismo archivo que compone render.py
+        con_fondo = bool(r["sujeto"].get("fondo") or r["sujeto"].get("fondo_img"))
+        if largo:
+            nombre, span0 = asset_sujeto(edit, fuentes[r["source"]], a, b, assets, relleno=con_fondo, ancho=CW)
+        else:
+            nombre, span0 = asset_sujeto(edit, assets / proxies[r["source"]], a, b, assets, relleno=con_fondo)
+        img = r["sujeto"].get("fondo_img")
+        if img:
+            ip = Path(img) if Path(img).is_absolute() else edit / img
+            shutil.copy2(ip, assets / ip.name)
         st0, du = round(t0 + a - r["start"], 3), round(b - a, 3)
         if any(e["T"] < st0 + du and e["T"] + e["dur"] > st0 for e in trans):
             print(f"  aviso: el recorte del clip {i + 1} se cruza con una transicion de color: "
                   "queda con el look de su inicio (acotarlo con sujeto.src)")
         lk = look_en(st0)
         sujetos.append({"n": len(sujetos) + 1, "i": i, "t0": st0, "dur": du, "ms": round(a - span0, 3),
-                        "asset": nombre, "fondo": r["sujeto"].get("fondo"),
+                        "asset": nombre, "fondo": r["sujeto"].get("fondo"), "fondo_img": r["sujeto"].get("fondo_img"),
                         "fondo_hasta": r["sujeto"].get("fondo_hasta"),
                         "fondo_hueco": r["sujeto"].get("fondo_hueco"), "css": css_clip[i],
                         "look": looks.get(lk) if lk else None})
@@ -268,27 +293,49 @@ def to_studio(edit: Path, force: bool) -> None:
     lines += html_sujetos(sujetos, etiqueta)
 
     # zooms animados (shorts): una marca por zoom en el timeline; escalan la camara de su clip
-    lineas_zoom, mapa_zoom = html_zooms(ventanas, etiqueta)
+    lineas_zoom, mapa_zoom = html_zooms(ventanas, etiqueta, (CW // 2, int(CH * 0.38)) if CW > CH else None)
     lines += lineas_zoom
 
     # slots HF (tarjetas, karaoke...): sus hosts en el timeline maestro
+    # composiciones con el mismo nombre en dos slots (el karaoke de cada uno es subtitles.html con id
+    # "subs") se renombran en el maestro; si no, la ultima pisa a las demas y sus timelines chocan
     mapa_slots = {}
-    for s in (edl.get("studio") or {}).get("slots", []):
+    slots_cfg = (edl.get("studio") or {}).get("slots", [])
+    nombres = [f.name for s in slots_cfg for f in ((edit / s["dir"]).resolve() / "compositions").glob("*.html")]
+    for s in slots_cfg:
         sdir = (edit / s["dir"]).resolve()
+        tag_slot = Path(s["dir"]).name
+        renombre = {}                               # src del slot -> (src en el maestro, id viejo, id nuevo)
         for f in (sdir / "compositions").glob("*.html"):
-            shutil.copy2(f, comps / f.name)
+            if nombres.count(f.name) > 1:
+                txt = f.read_text(encoding="utf-8")
+                m = re.search(r'data-composition-id="([^"]+)"', txt)
+                viejo = m.group(1) if m else f.stem
+                nuevo = f"{viejo}--{tag_slot}"
+                dst = comps / f"{tag_slot}--{f.name}"
+                dst.write_text(renombrar_comp(txt, viejo, nuevo), encoding="utf-8")
+                renombre[f"compositions/{f.name}"] = (f"compositions/{dst.name}", viejo, nuevo)
+            else:
+                shutil.copy2(f, comps / f.name)
         for f in (sdir / "assets").iterdir():
             if f.is_file() and f.name not in ("base.mp4", "README.md"):
                 shutil.copy2(f, assets / f.name)
         for h in hosts_de_slot(sdir / "index.html"):
             st, du = float(h["data-start"]) + s["t"], float(h["data-duration"])
             du = min(du, total - st)
+            hid, cid, src = h["id"], h["data-composition-id"], h["data-composition-src"]
+            if src in renombre:
+                src, _, cid = renombre[src]
+                hid = f"{h['id']}--{tag_slot}"
             lines.append(
-                f'    <div id="{h["id"]}" class="scene-layer clip" data-composition-id="{h["data-composition-id"]}"\n'
-                f'      data-composition-src="{h["data-composition-src"]}" data-timeline-label="{escape(h["id"])}"\n'
+                f'    <div id="{hid}" class="scene-layer clip" data-composition-id="{cid}"\n'
+                f'      data-composition-src="{src}" data-timeline-label="{escape(hid)}"\n'
                 f'      data-start="{st:.3f}" data-duration="{du:.3f}" data-track-index="{h.get("data-track-index", 2)}"\n'
                 f'      data-width="{CW}" data-height="{CH}" style="z-index: {h.get("data-z", 3)};"></div>')
-            mapa_slots[h["id"]] = {"slot": s["dir"], "t": s["t"], "src": h["data-composition-src"]}
+            mapa_slots[hid] = {"slot": s["dir"], "t": s["t"], "src": h["data-composition-src"], "hid": h["id"]}
+            if hid != h["id"]:
+                mapa_slots[hid].update({"src_maestro": src, "id_viejo": renombre[h["data-composition-src"]][1],
+                                        "id_nuevo": cid})
 
     # overlays con composicion (CTA): misma pieza que se renderiza en green screen
     mapa_ov = []
@@ -526,7 +573,8 @@ def from_studio(edit: Path, dry: bool) -> None:
         if abs(s0 + float(a["data-duration"]) - mapa["total"]) < 0.05 and abs(t_out - mapa["total"]) > 0.02:
             o1 = t_out
             notas.append(f"  {hid}: termina con el video ({mapa['total']:.2f} -> {t_out:.2f})")
-        cambios_slot.setdefault(info["slot"], []).append((hid, round(o0 - info["t"], 3), round(o1 - o0, 3), info["src"]))
+        cambios_slot.setdefault(info["slot"], []).append((info.get("hid", hid), round(o0 - info["t"], 3),
+                                                          round(o1 - o0, 3), info["src"], info))
 
     # 4) overlays (CTA): inicio en la salida
     edl = load_json(edit / "edl.json")
@@ -586,13 +634,17 @@ def from_studio(edit: Path, dry: bool) -> None:
         shutil.copy2(idx, bk / f"{sp.name}_index_{stamp}.html")
         txt = idx.read_text(encoding="utf-8")
 
-        for hid, st, du, src in hs:
+        for hid, st, du, src, info in hs:
             txt = re.sub(rf'(id="{re.escape(hid)}"[^>]*?data-start=")[\d.]+(")', rf"\g<1>{st:.3f}\g<2>", txt, count=1)
             txt = re.sub(rf'(id="{re.escape(hid)}"[^>]*?data-duration=")[\d.]+(")', rf"\g<1>{du:.3f}\g<2>", txt, count=1)
-            f = out / src
+            f = out / info.get("src_maestro", src)
             if editada_en_studio(f, mapa, sp / src):
                 shutil.copy2(sp / src, bk / f"{Path(src).stem}_{stamp}.html")
-                shutil.copy2(f, sp / src)
+                if info.get("src_maestro"):         # vuelve con el id que espera el slot
+                    (sp / src).write_text(renombrar_comp(f.read_text(encoding="utf-8"), info["id_nuevo"],
+                                                         info["id_viejo"]), encoding="utf-8")
+                else:
+                    shutil.copy2(f, sp / src)
                 print(f"  {src}: editada en Studio -> copiada a {sdir}")
         idx.write_text(txt, encoding="utf-8")
     for info in mapa["overlays"]:

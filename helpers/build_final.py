@@ -229,6 +229,7 @@ def main() -> int:
         sub = {k: v for k, v in edl.items() if k not in ("ranges", "overlays", "studio")}
         sub["ranges"] = tr["ranges"]
         sub["overlays"] = []
+        sub["edit_root"] = str(edit).replace("\\", "/")     # render.py: cache de recortes y fondos
         for ov in edl.get("overlays") or []:
             if tr["t0"] <= ov["start_in_output"] < tr["t0"] + tr["dur"]:
                 o = dict(ov)
@@ -270,7 +271,8 @@ def main() -> int:
                 key = next(iter(edl["sources"]))
                 run(PY + [HELP / "build_karaoke.py", "--transcript", edit / "transcripts" / f"{key}.json",
                           "--edl", tr["pcm"].parent / "edl.json",
-                          "--template", REPO / "presets" / "glass-composition" / "compositions" / "subtitles.html",
+                          "--template", REPO / (tr["slot"].get("karaoke_template")
+                                                or "presets/glass-composition/compositions/subtitles.html"),
                           "--output", sdir / "compositions" / "subtitles.html", "--frases", frases,
                           "--max-per-pill", "9"])
         # duraciones del slot = las del video base (root, video, audio, karaoke, padding)

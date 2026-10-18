@@ -30,8 +30,9 @@ def ventana_zoom(r: dict) -> tuple[float, float] | None:
     return (a, b) if b - a >= 0.05 else None
 
 
-def html_zooms(ventanas: list, etq: Callable[[str], str]) -> tuple[list[str], dict]:
-    """ventanas: [(t0, t1, r)] por clip. -> (marcas del timeline, mapa {id: emitido})."""
+def html_zooms(ventanas: list, etq: Callable[[str], str], origen_def=None) -> tuple[list[str], dict]:
+    """ventanas: [(t0, t1, r)] por clip. -> (marcas del timeline, mapa {id: emitido}).
+    `origen_def`: origen de los zooms sin `origen` (px del lienzo); por defecto la cara del short."""
     lines, mapa, n = [], {}, 0
     for i, (t0, t1, r) in enumerate(ventanas):
         w = ventana_zoom(r)
@@ -44,7 +45,7 @@ def html_zooms(ventanas: list, etq: Callable[[str], str]) -> tuple[list[str], di
         a, b = w
         st, du = round(t0 + a - r["start"], 3), round(b - a, 3)
         de, hasta = float(z.get("de", 1.0)), float(z.get("a", 1.08))
-        ox, oy = z.get("origen") or ORIGEN
+        ox, oy = z.get("origen") or origen_def or ORIGEN
         n += 1
         zid = f"z{n:03d}"
         lines.append(

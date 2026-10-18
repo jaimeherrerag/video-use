@@ -235,6 +235,76 @@ def censor_chain(regions: list) -> str:
     return ",".join(parts)
 
 
+# -------- Efectos de cámara de los largos (2026-10-18) ----------------------------------------
+# Los mismos campos que el Studio maestro muestra y edita (regla de oro): ranges[i].zoom,
+# edl.color (solo looks blanco y negro) y ranges[i].sujeto. En los shorts el maestro se renderiza en
+# HyperFrames; en los largos (proxy + tramos) los aplica este render con ffmpeg.
+
+LIENZO_W, LIENZO_H = 1920, 1080          # lienzo del Studio de los largos (origen del zoom en estos px)
+ORIGEN_LARGO = (960, 410)                # la cara en el set actual (igual que studio_maestro)
+
+
+def _ease(p: str, ease: str) -> str:
+    """Curva de GSAP como expresion de ffmpeg sobre p en [0, 1]."""
+    e = (ease or "power1.inOut").lower()
+    if "inout" in e:
+        return f"if(lt({p},0.5),2*{p}*{p},1-pow(2-2*{p},2)/2)"
+    if e.endswith(".out"):
+        return f"(1-pow(1-{p},2))"
+    if e.endswith(".in"):
+        return f"({p}*{p})"
+    return p
+
+
+def zoom_chain(z: dict, out_w: int, out_h: int, fps: int) -> str:
+    """zoompan sobre la fuente completa (4K): escala de `de` a `a` entre t0 y t1 (s del segmento) con el
+    origen fijo en el lienzo. La ventana se toma de la fuente, asi que hasta ~2x no se pierde nitidez,
+    y la salida tiene tamano fijo (sin cambiar de resolucion a mitad del filtro)."""
+    t0, dur = z["t0"], max(0.04, z["t1"] - z["t0"])
+    p = f"clip((in_time-{t0:.3f})/{dur:.3f},0,1)"
+    zz = f"max(1,{z['de']:.4f}+({z['a'] - z['de']:.4f})*{_ease(p, z.get('ease'))})"
+    fx, fy = z["ox"] / LIENZO_W, z["oy"] / LIENZO_H
+    return (f"zoompan=z='{zz}':x='{fx:.5f}*iw*(1-1/zoom)':y='{fy:.5f}*ih*(1-1/zoom)'"
+            f":d=1:s={out_w}x{out_h}:fps={fps}")
+
+
+def mono_filter(expr: str) -> str:
+    """Blanco y negro por tiempo: expr = cuanto mono (0..1) en t (s del segmento)."""
+    return f"hue=s='1-clip({expr},0,1)'"
+
+
+def es_mono(look) -> bool:
+    return isinstance(look, dict) and any(str(look.get("preset", "")).lower().startswith(m)
+                                          for m in ("mono", "bw", "blanco-y-negro"))
+
+
+def mono_expr_rango(color: dict | None, source: str, start: float, end: float) -> str | None:
+    """Expresion de 'cuanto blanco y negro' en el segmento [start, end] de la fuente, a partir de
+    edl.color (cambios anclados en la fuente, transicion corte o fundido)."""
+    if not color:
+        return None
+    looks = color.get("looks") or {}
+    cambios = sorted((c for c in color.get("cambios") or [] if c.get("source") == source),
+                     key=lambda c: float(c["src"]))
+    prev = 1.0 if es_mono(looks.get(color.get("inicial"))) else 0.0
+    base, terms = prev, []
+    for c in cambios:
+        nuevo = 1.0 if es_mono(looks.get(c.get("look"))) else 0.0
+        delta = nuevo - prev
+        prev = nuevo
+        if not delta:
+            continue
+        d = 0.001 if c.get("transicion", "corte") == "corte" else max(0.04, float(c.get("dur", 0.5)))
+        rel = float(c["src"]) - start
+        if rel + d <= 0:                         # ya termino antes del segmento: cuenta como base
+            base += delta
+        elif rel < end - start:
+            terms.append(f"{delta:+.0f}*clip((t-{rel:.3f})/{d:.3f},0,1)")
+    if not terms and base <= 0:
+        return None
+    return f"{base:.0f}" + "".join(terms)
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -249,6 +319,9 @@ def extract_segment(
     nvenc: bool = False,
     audio_filter: str | None = None,
     censor: list | None = None,
+    zoom: dict | None = None,
+    mono: str | None = None,
+    sujeto: dict | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -313,10 +386,19 @@ def extract_segment(
             vf_parts.append(censor_chain(censor))
         if is_hdr_source(source):
             vf_parts.append(TONEMAP_CHAIN)
-        vf_parts.append(scale)
+        ow, oh = (1280, 720) if draft else (1920, 1080)
+        if zoom and not portrait:
+            vf_parts.append(zoom_chain(zoom, ow, oh, fps))
+        else:
+            vf_parts.append(scale)
         if grade_filter:
             vf_parts.append(grade_filter)
         vf = ",".join(vf_parts)
+        if sujeto and not portrait:
+            _segmento_con_sujeto(source, seg_start, duration, vf, sujeto, mono, ow, oh, af, vcodec, fps, out_path)
+            return
+        if mono:
+            vf = f"{vf},{mono_filter(mono)}"
 
         cmd = [
             "ffmpeg", "-y",
@@ -424,6 +506,34 @@ def extract_segment(
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
+def _segmento_con_sujeto(source: Path, seg_start: float, duration: float, vf_cam: str, sj: dict,
+                         mono: str | None, ow: int, oh: int, af: str, vcodec: list, fps: int,
+                         out_path: Path) -> None:
+    """Fondo liso o imagen detras de la persona recortada (webm con alfa de recorte_color.py) durante
+    [a, b] del segmento; fuera de esa ventana, la camara tal cual."""
+    a, b = max(0.0, sj["a"]), min(duration, sj["b"])
+    off = sj["off"]                              # tiempo del webm cuando el segmento va en 0
+    ent_sj = ["-ss", f"{off:.3f}"] if off >= 0 else ["-itsoffset", f"{-off:.3f}"]
+    cmd = ["ffmpeg", "-y", "-ss", f"{seg_start:.3f}", "-i", str(source),
+           *ent_sj, "-c:v", "libvpx-vp9", "-i", str(sj["webm"])]
+    if sj.get("img"):
+        cmd += ["-loop", "1", "-t", f"{duration:.3f}", "-i", str(sj["img"])]
+        fondo = (f"[2:v]scale={ow}:{oh}:force_original_aspect_ratio=increase,crop={ow}:{oh},"
+                 f"fps={fps},format=yuv420p[bg];")
+    else:
+        fondo = f"color=c={sj.get('fondo') or '#EEEDE8'}:s={ow}x{oh}:r={fps}:d={duration:.3f},format=yuv420p[bg];"
+    ventana = f"between(t,{a:.3f},{b:.3f})"
+    fin = f",{mono_filter(mono)}" if mono else ""
+    fc = (f"[0:v]{vf_cam}[cam];{fondo}"
+          f"[1:v]scale={ow}:{oh}:flags=lanczos,format=yuva420p[sj];"
+          f"[cam][bg]overlay=0:0:enable='{ventana}':eof_action=pass[c1];"
+          f"[c1][sj]overlay=0:0:enable='{ventana}':eof_action=pass:format=auto,format=yuv420p{fin}[outv]")
+    cmd += ["-t", f"{duration:.3f}", "-filter_complex", fc, "-map", "[outv]", "-map", "0:a:0",
+            "-af", af, *vcodec, "-r", str(fps), "-c:a", "pcm_s16le", "-ar", "48000", "-shortest",
+            "-movflags", "+faststart", str(out_path)]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
 def extract_all_segments(
     edl: dict,
     edit_dir: Path,
@@ -450,6 +560,9 @@ def extract_all_segments(
     ranges = edl["ranges"]
     sources = edl["sources"]
     audio_filter = edl.get("audio_filter")
+    color = edl.get("color")
+    # raiz del proyecto (build_final la pone en el EDL de cada tramo): cache de recortes y fondos
+    root = Path(edl.get("edit_root") or edit_dir)
 
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
@@ -476,11 +589,43 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}{rf_tag}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
+        zoom = mono = sujeto = None
+        if r.get("zoom") and not reframe:
+            zr = r["zoom"]
+            a, b = zr.get("src") or [start, end]
+            a, b = max(a, start), min(b, end)
+            if b - a >= 0.05:
+                ox, oy = zr.get("origen") or ORIGEN_LARGO
+                zoom = {"t0": a - start, "t1": b - start, "de": float(zr.get("de", 1.0)),
+                        "a": float(zr.get("a", 1.08)), "ox": float(ox), "oy": float(oy), "ease": zr.get("ease")}
+                print(f"        zoom {zoom['de']:.2f}->{zoom['a']:.2f} en {zoom['t0']:.2f}-{zoom['t1']:.2f}s")
+        elif r.get("zoom"):
+            print("        aviso: zoom sobre un clip con encuadre fijo: no se aplica")
+        mono = mono_expr_rango(color, src_name, start, end)
+        if mono:
+            print(f"        blanco y negro: {mono}")
+        if r.get("sujeto") and not reframe:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from recorte_color import asset_sujeto  # noqa: E402  (numpy/scipy solo si hace falta)
+            sr = r["sujeto"]
+            a, b = sr.get("src") or [start, end]
+            a, b = max(a, start), min(b, end)
+            if b - a >= 0.05:
+                cache = root / "sujetos"
+                nombre, span0 = asset_sujeto(root, src_path, a, b, cache,
+                                             relleno=bool(sr.get("fondo") or sr.get("fondo_img")), ancho=LIENZO_W)
+                img = sr.get("fondo_img")
+                sujeto = {"webm": cache / nombre, "off": start - span0, "a": a - start, "b": b - start,
+                          "fondo": sr.get("fondo"),
+                          "img": (Path(img) if Path(img).is_absolute() else root / img) if img else None}
+                print(f"        recorte de sujeto {a - start:.2f}-{b - start:.2f}s sobre "
+                      f"{sr.get('fondo') or Path(img).name if img else sr.get('fondo')}")
         extract_segment(
             src_path, start, duration, seg_filter, out_path,
             preview=preview, draft=draft, reframe=reframe,
             fps=fps, high_quality=high_quality, nvenc=nvenc,
             audio_filter=audio_filter, censor=r.get("censor"),
+            zoom=zoom, mono=mono, sujeto=sujeto,
         )
         seg_paths.append(out_path)
 
