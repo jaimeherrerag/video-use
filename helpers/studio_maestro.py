@@ -327,11 +327,17 @@ def to_studio(edit: Path, force: bool) -> None:
             if src in renombre:
                 src, _, cid = renombre[src]
                 hid = f"{h['id']}--{tag_slot}"
+            # un host con tamano propio (tarjeta de esquina de 620x540, p.ej.) conserva su tamano y su
+            # posicion; los demas van a lienzo completo (scene-layer)
+            hw, hh = int(float(h.get("data-width", CW))), int(float(h.get("data-height", CH)))
+            propio = (hw, hh) != (CW, CH)
+            clase = "clip" if propio else "scene-layer clip"
+            estilo = (h.get("style", "").rstrip("; ") + "; " if propio else "") + f"z-index: {h.get('data-z', 3)};"
             lines.append(
-                f'    <div id="{hid}" class="scene-layer clip" data-composition-id="{cid}"\n'
+                f'    <div id="{hid}" class="{clase}" data-composition-id="{cid}"\n'
                 f'      data-composition-src="{src}" data-timeline-label="{escape(hid)}"\n'
                 f'      data-start="{st:.3f}" data-duration="{du:.3f}" data-track-index="{h.get("data-track-index", 2)}"\n'
-                f'      data-width="{CW}" data-height="{CH}" style="z-index: {h.get("data-z", 3)};"></div>')
+                f'      data-width="{hw}" data-height="{hh}" style="{estilo}"></div>')
             mapa_slots[hid] = {"slot": s["dir"], "t": s["t"], "src": h["data-composition-src"], "hid": h["id"]}
             if hid != h["id"]:
                 mapa_slots[hid].update({"src_maestro": src, "id_viejo": renombre[h["data-composition-src"]][1],
