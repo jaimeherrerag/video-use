@@ -321,6 +321,21 @@ def main() -> int:
             continue
         ranges.append({"source": args.key, "start": round(s, 3), "end": round(e, 3), "_words": list(g)})
 
+    # Tramos que van SIN cortar pausas (una muestra que corre en pantalla mientras
+    # Jaime la narra, 2026-10-17): "continuo" en cleanup_overrides.json, por tiempo
+    # de SOURCE. Los ranges que tocan el tramo se funden en uno que lo cubre entero.
+    if ov_path.exists():
+        for c in ov.get("continuo", []):
+            dentro = [r for r in ranges if r["end"] > c["desde"] and r["start"] < c["hasta"]]
+            if not dentro:
+                continue
+            k = ranges.index(dentro[0])
+            unido = {"source": args.key,
+                     "start": round(min(c["desde"], dentro[0]["start"]), 3),
+                     "end": round(max(c["hasta"], dentro[-1]["end"]), 3),
+                     "_words": [j for r in dentro for j in r["_words"]]}
+            ranges = ranges[:k] + [unido] + [r for r in ranges[k:] if r not in dentro]
+
     for r in ranges:
         texto = " ".join(V.txt(ws[j]) for j in r.pop("_words"))
         r["beat"] = texto if len(texto) <= 90 else texto[:87] + "..."
