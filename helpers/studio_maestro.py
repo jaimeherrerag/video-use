@@ -507,7 +507,8 @@ def from_studio(edit: Path, dry: bool) -> None:
         b1 = b0 + float(a["data-duration"])
         rect = rect_div(a.get("style", ""))
         for s0, s1, _, place, r in wins:
-            if s1 > b0 and s0 < b1:
+            # un blur que toca al clip vecino por el redondeo de Studio (1-8 ms) no es suyo
+            if min(s1, b1) - max(s0, b0) > 0.02:
                 sw, sh = dims[r["source"]]
                 x, y, wd, ht = lienzo_a_fuente(place, rect, sw, sh, CW, CH)
                 x0, y0 = max(0, int(x)), max(0, int(y))
