@@ -322,8 +322,14 @@ def extract_segment(
     zoom: dict | None = None,
     mono: str | None = None,
     sujeto: dict | None = None,
+    audio_de: tuple[Path, float] | None = None,
+    fundidos: tuple[bool, bool] = (True, True),
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
+
+    Grabacion separada (fuentes_obs.py): `audio_de` = (guia, inicio) toma el audio de OTRO archivo (la
+    guia, con el mic en PCM) en vez del de `source` (camara o pantalla, AAC). `fundidos` = (entrada, salida):
+    False en una juntura continua (un corte partido por un cambio de escena) para que el audio no baje.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
@@ -355,7 +361,10 @@ def extract_segment(
     # frames) and audio (exact samples) drift a few ms/segment, accumulating into
     # progressive audio desync across a long concat. See CLAUDE.md.
     fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03,apad"
+    af = ",".join([*(["afade=t=in:st=0:d=0.03"] if fundidos[0] else []),
+                   *([f"afade=t=out:st={fade_out_start:.3f}:d=0.03"] if fundidos[1] else []), "apad"])
+    # audio de la guia (grabacion separada): segunda entrada; el video sigue saliendo de `source`
+    ent_audio = ["-ss", f"{audio_de[1]:.3f}", "-i", str(audio_de[0])] if audio_de else []
     # Filtro de audio opcional (ej. denoise) ANTES de fades/apad, en la etapa PCM.
     # (Histórico: afftdn aquí junto a un -filter_complex de video (reframe)
     # deadlockeaba ffmpeg 8.0.1. RESUELTO en ffmpeg 9.0.1 — re-verificado
@@ -395,7 +404,8 @@ def extract_segment(
             vf_parts.append(grade_filter)
         vf = ",".join(vf_parts)
         if sujeto and not portrait:
-            _segmento_con_sujeto(source, seg_start, duration, vf, sujeto, mono, ow, oh, af, vcodec, fps, out_path)
+            _segmento_con_sujeto(source, seg_start, duration, vf, sujeto, mono, ow, oh, af, vcodec, fps, out_path,
+                                 ent_audio)
             return
         if mono:
             vf = f"{vf},{mono_filter(mono)}"
@@ -404,7 +414,9 @@ def extract_segment(
             "ffmpeg", "-y",
             "-ss", f"{seg_start:.3f}",
             "-i", str(source),
+            *ent_audio,
             "-t", f"{duration:.3f}",
+            *(["-map", "0:v:0", "-map", "1:a:0"] if ent_audio else []),
             "-vf", vf,
             "-af", af,
             *vcodec, "-r", str(fps),
@@ -488,13 +500,14 @@ def extract_segment(
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
+        *ent_audio,
         "-t", f"{duration:.3f}",
         "-filter_complex", fc,
         "-map", "[outv]",
         # Solo la pista del mic, igual que el legacy path (ffmpeg elige 0:a:0 por default).
         # "0:a" metia TODAS las pistas: con OBS mic+escritorio el segmento salia con dos
         # streams de audio y no cuadraba en el concat con los segmentos sin reframe.
-        "-map", "0:a:0",
+        "-map", "1:a:0" if ent_audio else "0:a:0",
         "-af", af,
         *vcodec, "-r", str(fps),
         # PCM lossless: el único encode AAC ocurre al final (loudnorm). Ver FINAL_AAC_BITRATE.
@@ -508,7 +521,7 @@ def extract_segment(
 
 def _segmento_con_sujeto(source: Path, seg_start: float, duration: float, vf_cam: str, sj: dict,
                          mono: str | None, ow: int, oh: int, af: str, vcodec: list, fps: int,
-                         out_path: Path) -> None:
+                         out_path: Path, ent_audio: list | None = None) -> None:
     """Fondo liso o imagen detras de la persona recortada (webm con alfa de recorte_color.py) durante
     [a, b] del segmento; fuera de esa ventana, la camara tal cual."""
     a, b = max(0.0, sj["a"]), min(duration, sj["b"])
@@ -528,10 +541,67 @@ def _segmento_con_sujeto(source: Path, seg_start: float, duration: float, vf_cam
           f"[1:v]scale={ow}:{oh}:flags=lanczos,format=yuva420p[sj];"
           f"[cam][bg]overlay=0:0:enable='{ventana}':eof_action=pass[c1];"
           f"[c1][sj]overlay=0:0:enable='{ventana}':eof_action=pass:format=auto,format=yuv420p{fin}[outv]")
-    cmd += ["-t", f"{duration:.3f}", "-filter_complex", fc, "-map", "[outv]", "-map", "0:a:0",
+    n_audio = 3 if sj.get("img") else 2              # la guia (si viene) entra despues de camara, recorte y fondo
+    cmd += [*(ent_audio or []), "-t", f"{duration:.3f}", "-filter_complex", fc, "-map", "[outv]",
+            "-map", f"{n_audio}:a:0" if ent_audio else "0:a:0",
             "-af", af, *vcodec, "-r", str(fps), "-c:a", "pcm_s16le", "-ar", "48000", "-shortest",
             "-movflags", "+faststart", str(out_path)]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def mascara_circulo(d: int, carpeta: Path) -> Path:
+    """PNG en escala de grises de d x d con un circulo blanco suavizado (alfa del pip), en cache."""
+    p = carpeta / f"circulo_{d}.png"
+    if not p.exists():
+        from PIL import Image, ImageDraw
+        carpeta.mkdir(parents=True, exist_ok=True)
+        k = 4                                          # supermuestreo: borde sin escalones
+        im = Image.new("L", (d * k, d * k), 0)
+        ImageDraw.Draw(im).ellipse([0, 0, d * k - 1, d * k - 1], fill=255)
+        im.resize((d, d), Image.LANCZOS).save(p)
+    return p
+
+
+def _segmento_pip(pantalla: Path, t_pant: float, camara: Path, t_cam: float, duration: float, pip: dict,
+                  grade_filter: str, censor: list | None, zoom: dict | None, mono: str | None,
+                  audio_de: tuple[Path, float], af: str, vcodec: list, fps: int, draft: bool,
+                  out_path: Path, cache: Path) -> None:
+    """Vista pantalla_camara (grabacion separada): la pantalla a cuadro completo y encima la camara en un
+    circulo, como la escena "Pantalla + webcam" de OBS. pip = {cx, cy, d, recorte: {x, y, w, h}} en px del
+    lienzo 1920x1080 (el recorte, en px de la camara). Un solo encode; el audio sale de la guia."""
+    ow, oh = (1280, 720) if draft else (1920, 1080)
+    k = ow / 1920
+    d = max(2, int(round(pip["d"] * k)) // 2 * 2)
+    x, y = int(round(pip["cx"] * k - d / 2)), int(round(pip["cy"] * k - d / 2))
+    rc = pip["recorte"]
+    base = [censor_chain(censor)] if censor else []
+    base.append(zoom_chain(zoom, ow, oh, fps) if zoom else f"scale={ow}:{oh}:flags=lanczos")
+    cam_grade = f",{grade_filter}" if grade_filter else ""     # el grade es de la camara, no de la pantalla
+    fin = f",{mono_filter(mono)}" if mono else ""
+    fc = (f"[0:v]{','.join(base)}[bg];"
+          f"[1:v]crop={rc['w']}:{rc['h']}:{rc['x']}:{rc['y']},scale={d}:{d}:flags=lanczos{cam_grade},format=rgba[c0];"
+          f"[2:v]format=gray,scale={d}:{d}[m];[c0][m]alphamerge[c];"
+          f"[bg][c]overlay={x}:{y}:format=auto,format=yuv420p{fin}[outv]")
+    cmd = ["ffmpeg", "-y", "-ss", f"{t_pant:.3f}", "-i", str(pantalla), "-ss", f"{t_cam:.3f}", "-i", str(camara),
+           "-loop", "1", "-i", str(mascara_circulo(int(round(pip["d"])), cache)),
+           "-ss", f"{audio_de[1]:.3f}", "-i", str(audio_de[0]),
+           "-t", f"{duration:.3f}", "-filter_complex", fc, "-map", "[outv]", "-map", "3:a:0",
+           "-af", af, *vcodec, "-r", str(fps), "-c:a", "pcm_s16le", "-ar", "48000", "-shortest",
+           "-movflags", "+faststart", str(out_path)]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def fuente_de_vista(edl: dict, r: dict) -> tuple[str, float]:
+    """Grabacion separada: (fuente de la imagen BASE del corte, desfase). Sin vista, la del corte."""
+    f = edl.get("fuentes")
+    if not f or not r.get("vista"):
+        return r["source"], 0.0
+    k = "camara" if r["vista"] == "camara" else "pantalla"
+    return k, float(f["desfase"].get(k, 0.0))
+
+
+def _en_rejilla(t: float, fps: int) -> bool:
+    return abs(t * fps - round(t * fps)) < 0.01
 
 
 def extract_all_segments(
@@ -576,17 +646,38 @@ def extract_all_segments(
         start = float(r["start"])
         end = float(r["end"])
         duration = end - start
-        out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
+        # grabacion separada (fuentes_obs.py): la imagen sale del archivo de la vista en t - desfase y el
+        # audio de la guia (src_name), que es el reloj de los cortes
+        vkey, off = fuente_de_vista(edl, r)
+        separada = bool(edl.get("fuentes") and r.get("vista"))
+        vpath = resolve_path(sources[vkey], edit_dir)
+        vstart = start - off
+        audio_de = (src_path, start) if separada else None
+        # juntura continua (el corte anterior/siguiente sigue en el mismo audio sin hueco): sin fundido
+        prev = ranges[i - 1] if i > 0 else None
+        nxt = ranges[i + 1] if i + 1 < len(ranges) else None
+        fundidos = (not (prev and prev["source"] == src_name and abs(float(prev["end"]) - start) < 0.002
+                         and _en_rejilla(start, fps)),
+                    not (nxt and nxt["source"] == src_name and abs(float(nxt["start"]) - end) < 0.002
+                         and _en_rejilla(end, fps)))
+        out_path = clips_dir / f"seg_{i:02d}_{vkey}.mp4"
 
+        cam_path, cam_start = vpath, vstart           # de donde sale la camara (para el grade y el pip)
+        if separada and r["vista"] != "camara":
+            off_cam = float(edl["fuentes"]["desfase"].get("camara", 0.0))
+            cam_path, cam_start = resolve_path(sources["camara"], edit_dir), start - off_cam
         if is_auto:
-            seg_filter, _stats = auto_grade_for_clip(src_path, start=start, duration=duration, verbose=False)
+            seg_filter, _stats = auto_grade_for_clip(cam_path, start=cam_start, duration=duration, verbose=False)
         else:
             seg_filter = resolved
+        if separada and r["vista"] == "pantalla":
+            seg_filter = ""                            # la pantalla no lleva el grade de la camara
 
         note = r.get("beat") or r.get("note") or ""
         reframe = r.get("reframe")
         rf_tag = f"  reframe={reframe['fit']}" if reframe else ""
-        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}{rf_tag}")
+        vs_tag = f"  vista={r['vista']}" if separada else ""
+        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}{rf_tag}{vs_tag}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
         zoom = mono = sujeto = None
@@ -604,7 +695,7 @@ def extract_all_segments(
         mono = mono_expr_rango(color, src_name, start, end)
         if mono:
             print(f"        blanco y negro: {mono}")
-        if r.get("sujeto") and not reframe:
+        if r.get("sujeto") and not reframe and vkey == ("camara" if separada else src_name):
             sys.path.insert(0, str(Path(__file__).parent))
             from recorte_color import asset_sujeto  # noqa: E402  (numpy/scipy solo si hace falta)
             sr = r["sujeto"]
@@ -612,21 +703,34 @@ def extract_all_segments(
             a, b = max(a, start), min(b, end)
             if b - a >= 0.05:
                 cache = root / "sujetos"
-                nombre, span0 = asset_sujeto(root, src_path, a, b, cache,
+                # el recorte sale del archivo de la imagen (la camara), en su tiempo
+                nombre, span0 = asset_sujeto(root, vpath, a - off, b - off, cache,
                                              relleno=bool(sr.get("fondo") or sr.get("fondo_img")), ancho=LIENZO_W)
                 img = sr.get("fondo_img")
-                sujeto = {"webm": cache / nombre, "off": start - span0, "a": a - start, "b": b - start,
+                sujeto = {"webm": cache / nombre, "off": vstart - span0, "a": a - start, "b": b - start,
                           "fondo": sr.get("fondo"),
                           "img": (Path(img) if Path(img).is_absolute() else root / img) if img else None}
                 print(f"        recorte de sujeto {a - start:.2f}-{b - start:.2f}s sobre "
                       f"{sr.get('fondo') or Path(img).name if img else sr.get('fondo')}")
-        extract_segment(
-            src_path, start, duration, seg_filter, out_path,
-            preview=preview, draft=draft, reframe=reframe,
-            fps=fps, high_quality=high_quality, nvenc=nvenc,
-            audio_filter=audio_filter, censor=r.get("censor"),
-            zoom=zoom, mono=mono, sujeto=sujeto,
-        )
+        if separada and r["vista"] == "pantalla_camara":
+            pip = {**edl["fuentes"]["pip"], **(r.get("pip") or {})}
+            fade_out_start = max(0.0, duration - 0.03)
+            af = ",".join([*([audio_filter] if audio_filter else []),
+                           *(["afade=t=in:st=0:d=0.03"] if fundidos[0] else []),
+                           *([f"afade=t=out:st={fade_out_start:.3f}:d=0.03"] if fundidos[1] else []), "apad"])
+            _segmento_pip(vpath, vstart, cam_path, cam_start, duration, pip, seg_filter, r.get("censor"), zoom,
+                          mono, audio_de, af, video_codec_args(nvenc=nvenc, draft=draft, preview=preview,
+                                                               high_quality=high_quality),
+                          fps, draft, out_path, root / "assets_fuentes")
+        else:
+            extract_segment(
+                vpath, vstart, duration, seg_filter, out_path,
+                preview=preview, draft=draft, reframe=reframe,
+                fps=fps, high_quality=high_quality, nvenc=nvenc,
+                audio_filter=audio_filter, censor=r.get("censor"),
+                zoom=zoom, mono=mono, sujeto=sujeto,
+                audio_de=audio_de, fundidos=fundidos,
+            )
         seg_paths.append(out_path)
 
     return seg_paths
