@@ -494,7 +494,8 @@ def leer_color(el: list, wins: list, clip_attrs: list, mapa: dict, a_salida: Cal
             continue
         st, info = float(a.get("data-start", 0)), em.get(a["id"])
         if info and abs(info["start"] - st) <= 0.02:
-            src, source = float(a.get("data-media-start", 0)), info["source"]
+            # grabacion separada: la copia va en el tiempo del archivo de la imagen; el ancla, en el de la guia
+            src, source = float(a.get("data-media-start", 0)) + info.get("off", 0.0), info["source"]
         else:
             debajo = next(((s0, r) for s0, s1, _, _, r in wins if s0 - 1e-3 <= st < s1), None)
             if not debajo:

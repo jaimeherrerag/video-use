@@ -133,6 +133,14 @@ def lienzo(edl_o_mapa: dict) -> tuple[int, int]:
     return int(c.get("w", W)), int(c.get("h", H))
 
 
+def vista_imagen(fsep: dict | None, r: dict) -> tuple[str, float]:
+    """Grabacion separada: (fuente de la imagen del corte, desfase respecto a la guia). Sin vista, la suya."""
+    if not fsep or not r.get("vista"):
+        return r["source"], 0.0
+    k = "camara" if r["vista"] == "camara" else "pantalla"
+    return k, float(fsep["desfase"].get(k, 0.0))
+
+
 def asset_completo(src: Path, dst: Path) -> None:
     """Copia a resolucion completa para un maestro sin proxy (shorts): GOP de 6 para que
     HyperFrames busque exacto al renderizar, y el audio del mic (0:a:0, el mismo de render.py)."""
@@ -197,6 +205,12 @@ def to_studio(edit: Path, force: bool) -> None:
             sys.exit(f"edl.color: en un largo render.py solo aplica looks blanco y negro (preset mono*); "
                      f"no sabe hacer: {', '.join(otros)}")
 
+    # grabacion separada (fuentes_obs.py): los cortes van en el tiempo de la guia, pero la imagen sale del
+    # archivo de su vista (camara o pantalla) en t - desfase; la pantalla_camara lleva ademas la camara en
+    # un circulo como elemento propio (se mueve y escala en el canvas)
+    fsep = edl.get("fuentes")
+    vis = [vista_imagen(fsep, r) for r in edl["ranges"]]
+
     # ventana de cada clip en la salida, y el plan de color sobre ellas (cambios anclados en la fuente)
     ventanas, t = [], 0.0
     for r in edl["ranges"]:
@@ -211,29 +225,50 @@ def to_studio(edit: Path, force: bool) -> None:
     clip_win, css_clip = [], []                     # (t0, t1, place) y el CSS de encuadre por range
     for i, (t0, t1, r) in enumerate(ventanas):
         d = round(t1 - t0, 3)
-        sw, sh = dims[r["source"]]
+        vk, off = vis[i]
+        sw, sh = dims[vk]
         place = place_de_reframe(r.get("reframe"), sw, sh, CW, CH)
         css = css_de_place(place, sw, sh)
         text = range_words(edit / "transcripts", r["source"], r["start"], r["end"], cache) or r.get("beat", "")
         label = etiqueta(f"{i + 1} · {text}")
         style = f' style="{css}"' if css else ""
         g = attr_grading(looks.get(fijos[i]) if fijos[i] else None)
+        v_attr = f' data-vista="{r["vista"]}"' if fsep and r.get("vista") else ""
         lines.append(
-            f'    <video id="c{i + 1:03d}" src="assets/{proxies[r["source"]]}" data-range="{i}" data-zclip="{i}"'
-            f' data-source="{escape(r["source"])}" data-timeline-label="{escape(label)}"\n'
-            f'      data-start="{t0:.3f}" data-duration="{d:.3f}" data-media-start="{r["start"]:.3f}"'
+            f'    <video id="c{i + 1:03d}" src="assets/{proxies[vk]}" data-range="{i}" data-zclip="{i}"'
+            f' data-source="{escape(vk)}"{v_attr} data-timeline-label="{escape(label)}"\n'
+            f'      data-start="{t0:.3f}" data-duration="{d:.3f}" data-media-start="{r["start"] - off:.3f}"'
             f' data-has-audio="true" data-track-index="0"{g}{style} playsinline></video>')
         clip_win.append((t0, t1, place))
         css_clip.append(css)
-    # transiciones de color a mitad de clip: copias graduadas encima de la camara
-    lines += html_color(trans, looks, proxies, css_clip, etiqueta)
+        if fsep and r.get("vista") == "pantalla_camara":
+            # la camara en el circulo, como en la escena de OBS: object-fit cover sobre una caja cuadrada y
+            # object-position para el mismo recorte (en un 4K, el cuadrado de 2160 corrido a la derecha)
+            pip = {**fsep["pip"], **(r.get("pip") or {})}
+            dm, rc = pip["d"] * CW / 1920, pip["recorte"]
+            cw_, ch_ = dims["camara"]
+            px = 100 * rc["x"] / max(1, cw_ - rc["w"]) if cw_ > rc["w"] else 50
+            py = 100 * rc["y"] / max(1, ch_ - rc["h"]) if ch_ > rc["h"] else 50
+            lines.append(
+                f'    <video id="p{i + 1:03d}" src="assets/{proxies["camara"]}" data-pip="{i}" data-source="camara"'
+                f' data-timeline-label="{escape(etiqueta(f"Cámara (círculo) · clip {i + 1}"))}"\n'
+                f'      data-start="{t0:.3f}" data-duration="{d:.3f}"'
+                f' data-media-start="{r["start"] - float(fsep["desfase"].get("camara", 0)):.3f}"'
+                f' data-has-audio="false" data-track-index="2"\n'
+                f'      style="left: {pip["cx"] * CW / 1920 - dm / 2:.1f}px; top: {pip["cy"] * CH / 1080 - dm / 2:.1f}px;'
+                f' width: {dm:.1f}px; height: {dm:.1f}px; object-position: {px:.2f}% {py:.2f}%;" muted playsinline></video>')
+    # transiciones de color a mitad de clip: copias graduadas encima de la camara (en la grabacion
+    # separada, del archivo de la vista y en su tiempo)
+    trans_html = [{**e, "copias": [dict(c, source=vis[c["i"]][0], ms=round(c["ms"] - vis[c["i"]][1], 3))
+                                   for c in e["copias"]]} for e in trans]
+    lines += html_color(trans_html, looks, proxies, css_clip, etiqueta)
 
     # blurs: un rectangulo por censor y por range, en coordenadas del lienzo
     nb = 0
     for i, r in enumerate(edl["ranges"]):
         for c in r.get("censor") or []:
             t0, t1, place = clip_win[i]
-            sw, sh = dims[r["source"]]
+            sw, sh = dims[vis[i][0]]
             x, y, wd, ht = fuente_a_lienzo(place, (c["x"], c["y"], c["w"], c["h"]), sw, sh, CW, CH)
             nb += 1
             lines.append(
@@ -271,10 +306,12 @@ def to_studio(edit: Path, force: bool) -> None:
         # largos: el recorte sale de la fuente ORIGINAL bajada al ancho del lienzo (el proxy de 540p
         # no sirve para el render) y es el mismo archivo que compone render.py
         con_fondo = bool(r["sujeto"].get("fondo") or r["sujeto"].get("fondo_img"))
+        vk, off = vis[i]                            # grabacion separada: el recorte sale de la camara
         if largo:
-            nombre, span0 = asset_sujeto(edit, fuentes[r["source"]], a, b, assets, relleno=con_fondo, ancho=CW)
+            nombre, span0 = asset_sujeto(edit, fuentes[vk], a - off, b - off, assets, relleno=con_fondo, ancho=CW)
         else:
-            nombre, span0 = asset_sujeto(edit, assets / proxies[r["source"]], a, b, assets, relleno=con_fondo)
+            nombre, span0 = asset_sujeto(edit, assets / proxies[vk], a - off, b - off, assets, relleno=con_fondo)
+        span0 += off                                # en el tiempo de la guia, como los cortes
         img = r["sujeto"].get("fondo_img")
         if img:
             ip = Path(img) if Path(img).is_absolute() else edit / img
@@ -388,6 +425,7 @@ def to_studio(edit: Path, force: bool) -> None:
        blur 6, overlays 7 */
     #root video[data-range] {{ z-index: 1; }}
     #root video[data-broll] {{ z-index: 2; }}
+    #root video[data-pip] {{ inset: auto; z-index: 2; border-radius: 50%; object-fit: cover; }}
     .scene-layer {{ position: absolute; top: 0; left: 0; width: {CW}px; height: {CH}px; z-index: 3; }}
     .blur-censura {{ z-index: 6; backdrop-filter: blur(16px); background: rgba(239, 68, 68, 0.10);
                     outline: 3px dashed rgba(239, 68, 68, 0.9); }}
@@ -416,7 +454,9 @@ def to_studio(edit: Path, force: bool) -> None:
             "broll": edl.get("broll") or [],
             "color": color,
             "el_color": {f"cg{n:02d}a": {"start": e["copias"][0]["start"], "source": e["copias"][0]["source"],
-                                          "k": e["k"]} for n, e in enumerate(trans, 1)},
+                                          "k": e["k"], "off": vis[e["copias"][0]["i"]][1]}
+                         for n, e in enumerate(trans, 1)},
+            "fuentes": fsep,
             "sujetos": {f"s{s['n']:03d}": {"range": s["i"], "start": s["t0"], "dur": s["dur"], "ms": s["ms"]}
                         for s in sujetos},
             "sujeto_assets": sujeto_assets,
@@ -454,14 +494,16 @@ def from_studio(edit: Path, dry: bool) -> None:
         if tag == "video" and "data-range" in a and not oculto(a):
             clips.append(a)
     clips.sort(key=lambda a: (float(a.get("data-start", 0)), a["_order"]))
+    fsep = mapa.get("fuentes")
     ranges, wins, notas, t_out = [], [], [], 0.0
     orig_idx, clip_attrs = [], []                   # por range nuevo: su range original y su <video>
     for a in clips:
         orig = base_ranges[int(a["data-range"])]
         r = {k: v for k, v in orig.items() if k not in ("censor", "sujeto", "zoom")}
-        ms, du = float(a.get("data-media-start", 0)), float(a["data-duration"])
+        vk, off = vista_imagen(fsep, orig)          # grabacion separada: la imagen va en t - desfase
+        ms, du = float(a.get("data-media-start", 0)) + off, float(a["data-duration"])
         r["start"], r["end"] = round(ms, 3), round(ms + du, 3)
-        sw, sh = dims[r["source"]]
+        sw, sh = dims[vk]
         place = place_de_css(a.get("style", ""), sw, sh, CW, CH)
         if place and place.get("oculto"):
             notas.append(f"  {a['id']}: el clip quedo fuera del lienzo -> se descarta")
@@ -515,12 +557,36 @@ def from_studio(edit: Path, dry: bool) -> None:
         for s0, s1, _, place, r in wins:
             # un blur que toca al clip vecino por el redondeo de Studio (1-8 ms) no es suyo
             if min(s1, b1) - max(s0, b0) > 0.02:
-                sw, sh = dims[r["source"]]
+                sw, sh = dims[vista_imagen(fsep, r)[0]]
                 x, y, wd, ht = lienzo_a_fuente(place, rect, sw, sh, CW, CH)
                 x0, y0 = max(0, int(x)), max(0, int(y))
                 box = {"x": x0, "y": y0, "w": int(min(sw, x + wd) - x0), "h": int(min(sh, y + ht) - y0)}
                 if box["w"] > 2 and box["h"] > 2:
                     r.setdefault("censor", []).append(box)
+    # 2a) grabacion separada: el circulo de la camara (posicion y tamano en el lienzo); si se borro u oculto,
+    # el clip queda en vista pantalla
+    if fsep:
+        pips = {}
+        for tag, a in p.el:
+            if tag == "video" and "data-pip" in a and not oculto(a):
+                pips.setdefault(int(a["data-pip"]), []).append(a)
+        for k, r in enumerate(ranges):
+            if r.get("vista") != "pantalla_camara":
+                continue
+            o = orig_idx[k]
+            if o not in pips:
+                r["vista"] = "pantalla"
+                r.pop("pip", None)
+                notas.append(f"  clip {k + 1}: se quito la camara del circulo -> vista pantalla")
+                continue
+            x, y, wd, ht = rect_div(pips[o][0].get("style", ""))
+            nuevo = {"cx": round((x + wd / 2) * 1920 / CW), "cy": round((y + ht / 2) * 1080 / CH),
+                     "d": int(round(min(wd, ht) * 1920 / CW)) // 2 * 2}
+            base = {**fsep["pip"], **(base_ranges[o].get("pip") or {})}
+            if any(abs(nuevo[c] - base[c]) > 2 for c in nuevo):
+                r["pip"] = {**(base_ranges[o].get("pip") or {}), **nuevo}
+                notas.append(f"  clip {k + 1}: circulo de la camara -> centro ({nuevo['cx']}, {nuevo['cy']}), {nuevo['d']} px")
+
     n_cens = sum(len(r.get("censor", [])) for r in ranges)
     n_cens0 = sum(len(r.get("censor") or []) for r in base_ranges)
     if n_cens != n_cens0:
