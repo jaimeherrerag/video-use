@@ -257,6 +257,17 @@ def to_studio(edit: Path, force: bool) -> None:
                 f' data-has-audio="false" data-track-index="2"\n'
                 f'      style="left: {pip["cx"] * CW / 1920 - dm / 2:.1f}px; top: {pip["cy"] * CH / 1080 - dm / 2:.1f}px;'
                 f' width: {dm:.1f}px; height: {dm:.1f}px; object-position: {px:.2f}% {py:.2f}%;" muted playsinline></video>')
+        if fsep and r.get("arriba"):
+            # 50/50 de los shorts: la pantalla en el panel de arriba, cortada igual que el clip y con su
+            # encuadre editable (r.arriba es un reframe "place" sobre el archivo de la pantalla)
+            psw, psh = dims["pantalla"]
+            pcss = css_de_place(place_de_reframe(r["arriba"], psw, psh, CW, CH), psw, psh)
+            lines.append(
+                f'    <video id="a{i + 1:03d}" src="assets/{proxies["pantalla"]}" data-arriba="{i}" data-source="pantalla"'
+                f' data-timeline-label="{escape(etiqueta(f"Pantalla · clip {i + 1}"))}"\n'
+                f'      data-start="{t0:.3f}" data-duration="{d:.3f}"'
+                f' data-media-start="{r["start"] - float(fsep["desfase"].get("pantalla", 0)):.3f}"'
+                f' data-has-audio="false" data-track-index="1" style="{pcss}" muted playsinline></video>')
     # transiciones de color a mitad de clip: copias graduadas encima de la camara (en la grabacion
     # separada, del archivo de la vista y en su tiempo)
     trans_html = [{**e, "copias": [dict(c, source=vis[c["i"]][0], ms=round(c["ms"] - vis[c["i"]][1], 3))
@@ -426,6 +437,7 @@ def to_studio(edit: Path, force: bool) -> None:
     #root video[data-range] {{ z-index: 1; }}
     #root video[data-broll] {{ z-index: 2; }}
     #root video[data-pip] {{ inset: auto; z-index: 2; border-radius: 50%; object-fit: cover; }}
+    #root video[data-arriba] {{ z-index: 1; }}
     .scene-layer {{ position: absolute; top: 0; left: 0; width: {CW}px; height: {CH}px; z-index: 3; }}
     .blur-censura {{ z-index: 6; backdrop-filter: blur(16px); background: rgba(239, 68, 68, 0.10);
                     outline: 3px dashed rgba(239, 68, 68, 0.9); }}
@@ -586,6 +598,25 @@ def from_studio(edit: Path, dry: bool) -> None:
             if any(abs(nuevo[c] - base[c]) > 2 for c in nuevo):
                 r["pip"] = {**(base_ranges[o].get("pip") or {}), **nuevo}
                 notas.append(f"  clip {k + 1}: circulo de la camara -> centro ({nuevo['cx']}, {nuevo['cy']}), {nuevo['d']} px")
+        # 50/50: el encuadre de la pantalla de arriba (o que se quito)
+        arribas = {}
+        for tag, a in p.el:
+            if tag == "video" and "data-arriba" in a and not oculto(a):
+                arribas.setdefault(int(a["data-arriba"]), []).append(a)
+        psw, psh = dims.get("pantalla", (1920, 1080))
+        for k, r in enumerate(ranges):
+            o = orig_idx[k]
+            if not base_ranges[o].get("arriba"):
+                continue
+            if o not in arribas:
+                r.pop("arriba", None)
+                notas.append(f"  clip {k + 1}: se quito la pantalla de arriba")
+                continue
+            pl = place_de_css(arribas[o][0].get("style", ""), psw, psh, CW, CH)
+            p0 = place_de_reframe(base_ranges[o]["arriba"], psw, psh, CW, CH)
+            if pl and not (p0 and all(abs(x - y) < 2 for x, y in zip(pl["src"] + pl["dst"], p0["src"] + p0["dst"]))):
+                r["arriba"] = reframe_de_place(pl, CW, CH)
+                notas.append(f"  clip {k + 1}: pantalla de arriba -> {r['arriba']['src_crop']}")
 
     n_cens = sum(len(r.get("censor", [])) for r in ranges)
     n_cens0 = sum(len(r.get("censor") or []) for r in base_ranges)

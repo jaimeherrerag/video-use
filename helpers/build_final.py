@@ -112,11 +112,17 @@ def build_maestro(edit: Path, edl: dict, spec: dict, spec_path: Path, fps: int, 
             src = Path(edl["sources"][k])
             entradas += ["-i", src if src.is_absolute() else (edit / src).resolve()]
         fc = []
-        for i, r in enumerate(edl["ranges"]):
+        rs = edl["ranges"]
+
+        def continua(a: dict, b: dict) -> bool:
+            # corte partido por un cambio de escena (grabacion separada): el audio sigue sin hueco
+            return a["source"] == b["source"] and abs(a["end"] - b["start"]) < 0.002
+        for i, r in enumerate(rs):
             du = r["end"] - r["start"]
+            fi = "" if i > 0 and continua(rs[i - 1], r) else "afade=t=in:st=0:d=0.03,"
+            fo = "" if i + 1 < len(rs) and continua(r, rs[i + 1]) else f"afade=t=out:st={max(0.0, du - 0.03):.4f}:d=0.03,"
             fc.append(f"[{claves.index(r['source'])}:a:0]atrim=start={r['start']:.4f}:end={r['end']:.4f},"
-                      f"asetpts=PTS-STARTPTS,aresample=48000,afade=t=in:st=0:d=0.03,"
-                      f"afade=t=out:st={max(0.0, du - 0.03):.4f}:d=0.03[a{i}]")
+                      f"asetpts=PTS-STARTPTS,aresample=48000,{fi}{fo}anull[a{i}]")
         n = len(edl["ranges"])
         fc.append("".join(f"[a{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1[voz]")
         run(["ffmpeg", "-v", "error", "-y", *entradas, "-filter_complex", ";".join(fc),

@@ -316,19 +316,113 @@ def vistas(edit: Path) -> None:
           + ", ".join(f"{v} {n}" for v, n in sorted(cuenta.items())))
 
 
+def tramo(origen: Path, desde: float, hasta: float, edit: Path, ancho_cam: int) -> None:
+    """Para un short: el pedazo [desde, hasta] (segundos de la guia) de los tres archivos, ya alineados (los
+    tres empiezan en el mismo instante, asi el desfase queda en 0), en el edit del short. La camara se baja a
+    `ancho_cam` (2560 = margen para reencuadrar el panel de 1080x960 sin agrandar); la pantalla va nativa."""
+    fo = json.loads((origen / "fuentes.json").read_text(encoding="utf-8"))
+    a = round(round(max(0.0, desde) * FPS) / FPS, 4)
+    dur = round(hasta - a, 3)
+    edit.mkdir(parents=True, exist_ok=True)
+    salidas = {}
+    for k, src, extra in (("guia", fo["guia"], []),
+                          ("camara", fo["archivos"]["camara"], ["-vf", f"scale={ancho_cam}:-2:flags=lanczos"]),
+                          ("pantalla", fo["archivos"]["pantalla"], [])):
+        t0 = a - (fo["desfase"].get(k, 0.0) if k != "guia" else 0.0)
+        dst = edit / f"fuente_{k}.mov"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t0:.4f}", "-i", src, "-t", f"{dur:.3f}",
+                        "-map", "0:v:0", "-map", "0:a?", *extra, "-r", str(FPS), "-c:v", "libx264", "-preset", "slow",
+                        "-crf", "14", "-pix_fmt", "yuv420p", "-g", "6", "-keyint_min", "6", "-sc_threshold", "0",
+                        "-c:a", "pcm_s16le", "-ar", "48000", str(dst)], check=True)
+        salidas[k] = dst
+        print(f"  {k:9s} {src.split('/')[-1]} desde {t0:.3f}s -> {dst.name}")
+    wav = edit / "mic16k.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(salidas["guia"]), "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+                    "-c:a", "pcm_s16le", str(wav)], check=True)
+    # el desfase de los pedazos se vuelve a medir: deberia salir 0 (si no, la extraccion movio un cuadro)
+    g = mono16k(salidas["guia"])
+    desf = {}
+    for k in SUFIJOS:
+        d, c = desfase(g, mono16k(salidas[k]))
+        desf[k] = round(d, 4)
+        print(f"  desfase del pedazo {k}: {d * 1000:+.1f} ms (correlacion {c:.2f})")
+    escenas = [dict(e, desde=round(max(0.0, e["desde"] - a), 3)) for e in fo["escenas"] if e["desde"] < hasta]
+    escenas = [e for i, e in enumerate(escenas) if i + 1 == len(escenas) or escenas[i + 1]["desde"] > 0] or \
+        [{"desde": 0.0, "escena": "?", "vista": "camara"}]
+    escenas[0]["desde"] = 0.0
+    k_cam = ancho_cam / probe_ancho(fo["archivos"]["camara"])
+    pip = dict(fo["pip"], recorte={c: int(round(v * k_cam)) for c, v in fo["pip"]["recorte"].items()})
+    f = {"guia": str(salidas["guia"]).replace("\\", "/"),
+         "archivos": {k: str(salidas[k]).replace("\\", "/") for k in SUFIJOS}, "desfase": desf,
+         "escenas": escenas, "vistas_por_escena": fo["vistas_por_escena"], "pip": pip,
+         "origen": {"edit": str(origen).replace("\\", "/"), "desde": a, "hasta": hasta},
+         "generado": datetime.now().isoformat(timespec="seconds")}
+    (edit / "fuentes.json").write_text(json.dumps(f, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"  -> {edit / 'fuentes.json'}  (transcribir mic16k.wav con la clave 'guia' y build_cleanup_edl sobre "
+          f"{salidas['guia'].name})")
+
+
+def probe_ancho(src: str) -> int:
+    return int(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width",
+                               "-of", "csv=p=0", src], capture_output=True, text=True, check=True).stdout.strip())
+
+
+def cincuenta(edit: Path, pantalla_xy: tuple[int, int] | None) -> None:
+    """50/50 de los shorts en todos los cortes: la camara abajo (vista camara, un cuadro de 9:8 centrado en la
+    cara a resolucion 1:1 del archivo) y la pantalla arriba (una zona de 1080x960 a 1:1: el texto se lee).
+    Despues se ajusta todo en Studio."""
+    edl_p = edit / "edl.json"
+    edl = json.loads(edl_p.read_text(encoding="utf-8"))
+    f = edl.get("fuentes")
+    if not f:
+        sys.exit("el edl.json no tiene fuentes: corre antes `vistas`")
+    fuentes = edl["sources"]
+    cw, ch = probe_ancho(fuentes["camara"]), None
+    ch = int(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height",
+                             "-of", "csv=p=0", fuentes["camara"]], capture_output=True, text=True, check=True).stdout)
+    pw = probe_ancho(fuentes["pantalla"])
+    # camara: todo el alto, ancho 9:8, centrado en la cara (el centro del recorte del circulo de OBS)
+    rc = f["pip"]["recorte"]
+    cara_x = rc["x"] + rc["w"] / 2
+    w = int(ch * 1080 / 960) // 2 * 2
+    x = int(min(max(0, cara_x - w / 2), cw - w))
+    cam = {"src_crop": {"x": x, "y": 0, "w": w, "h": ch}, "dst": {"x": 0, "y": 960, "w": 1080, "h": 960},
+           "out_size": {"w": 1080, "h": 1920}, "fit": "place"}
+    px, py = pantalla_xy or ((pw - 1080) // 2, 60)
+    arriba = {"src_crop": {"x": px, "y": py, "w": 1080, "h": 960}, "dst": {"x": 0, "y": 0, "w": 1080, "h": 960},
+              "out_size": {"w": 1080, "h": 1920}, "fit": "place"}
+    for r in edl["ranges"]:
+        r["vista"], r["reframe"], r["arriba"] = "camara", cam, arriba
+    edl.setdefault("studio", {}).update({"canvas": {"w": 1080, "h": 1920}, "proxy": False, "render": "maestro"})
+    edl_p.write_text(json.dumps(edl, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"  {len(edl['ranges'])} cortes en 50/50: camara {cam['src_crop']} abajo, pantalla {arriba['src_crop']} arriba")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["ingesta", "vistas"])
+    ap.add_argument("cmd", choices=["ingesta", "vistas", "tramo", "cincuenta"])
     ap.add_argument("--guia", type=Path, help="ingesta: el archivo principal de OBS (la guia de 720p)")
     ap.add_argument("--edit-dir", required=True, type=Path)
+    ap.add_argument("--origen", type=Path, help="tramo: el edit del largo (con su fuentes.json)")
+    ap.add_argument("--desde", type=float, help="tramo: segundo de la guia donde empieza")
+    ap.add_argument("--hasta", type=float, help="tramo: segundo de la guia donde termina")
+    ap.add_argument("--ancho-camara", type=int, default=2560, help="tramo: ancho de la camara del pedazo")
+    ap.add_argument("--pantalla", help="cincuenta: x,y de la zona de 1080x960 de la pantalla (default centrada)")
     a = ap.parse_args()
     edit = a.edit_dir.resolve()
     if a.cmd == "ingesta":
         if not a.guia:
             ap.error("ingesta necesita --guia")
         ingesta(a.guia.resolve(), edit)
-    else:
+    elif a.cmd == "vistas":
         vistas(edit)
+    elif a.cmd == "tramo":
+        if not (a.origen and a.desde is not None and a.hasta is not None):
+            ap.error("tramo necesita --origen, --desde y --hasta")
+        tramo(a.origen.resolve(), a.desde, a.hasta, edit, a.ancho_camara)
+    else:
+        xy = tuple(int(v) for v in a.pantalla.split(",")) if a.pantalla else None
+        cincuenta(edit, xy)
     return 0
 
 
