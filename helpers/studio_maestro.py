@@ -693,6 +693,14 @@ def from_studio(edit: Path, dry: bool) -> None:
 
     # 4) overlays (CTA): inicio en la salida
     edl = load_json(edit / "edl.json")
+    # edl.json editado despues de generar este Studio: from-studio lo regresa a lo que tiene Studio
+    # (asi se perdieron "que" y "las" del auditor en el largo del segundo cerebro, 2026-10-27)
+    distintos = [k for k, (x, y) in enumerate(zip(edl["ranges"], base_ranges))
+                 if (x["start"], x["end"]) != (y["start"], y["end"])]
+    if distintos or len(edl["ranges"]) != len(base_ranges):
+        notas.append(f"  OJO edl.json cambio despues de generar el Studio (ranges {distintos[:8]}"
+                     f"{'...' if len(distintos) > 8 else ''}): from-studio los pisa con lo de Studio. "
+                     "Si eran correcciones, reaplicarlas y to-studio --force")
     overlays = edl.get("overlays") or []
     for info in mapa["overlays"]:
         tag_a = por_id.get(info["id"])
