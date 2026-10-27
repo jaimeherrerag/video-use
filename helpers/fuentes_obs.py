@@ -64,9 +64,9 @@ def archivo_de_vista(vista: str) -> str:
 
 # ── audio y desfases ──────────────────────────────────────────────────────────
 
-def mono16k(src: Path, segundos: float | None = None) -> np.ndarray:
+def mono16k(src: Path, segundos: float | None = None, desde: float = 0.0) -> np.ndarray:
     """Pista 1 (el mic) de un archivo como mono 16 kHz en float32."""
-    t = ["-t", f"{segundos:.1f}"] if segundos else []
+    t = (["-t", f"{segundos:.1f}"] if segundos else []) + (["-ss", f"{desde:.2f}"] if desde else [])
     out = subprocess.run(["ffmpeg", "-v", "error", *t, "-i", str(src), "-map", "0:a:0", "-ac", "1", "-ar", "16000",
                           "-f", "s16le", "-"], capture_output=True, check=True).stdout
     return np.frombuffer(out, np.int16).astype(np.float32) / 32768
@@ -103,14 +103,16 @@ def buscar_log(guia: Path) -> Path | None:
     return None
 
 
-def escenas_del_log(log: Path, guia: Path) -> tuple[list[dict], str | None]:
+def escenas_del_log(log: Path, guia: Path) -> tuple[list[dict], str | None, list[float]]:
     """Escenas al aire durante la grabacion de `guia`, en segundos de la guia: [{desde, escena}].
-    Devuelve tambien el nombre de la coleccion de escenas que estaba cargada."""
+    Devuelve tambien el nombre de la coleccion de escenas que estaba cargada y el segundo de cada pausa."""
     lineas = log.read_text(encoding="utf-8", errors="replace").splitlines()
     rx_t = re.compile(r"^(\d\d:\d\d:\d\d\.\d+): (.*)$")
     rx_esc = re.compile(r"(?:User s|S)witched to scene '(.*)'")
     escena, coleccion, t0, eventos, grabando = None, None, None, [], False
     previo = None
+    # la pausa de OBS no avanza el archivo: se resta, y un cambio en pausa entra donde se pauso
+    pausado_desde, en_pausa, pausas = None, 0.0, []
     for ln in lineas:
         m = rx_t.match(ln)
         if not m:
@@ -122,10 +124,19 @@ def escenas_del_log(log: Path, guia: Path) -> tuple[list[dict], str | None]:
         mc = re.search(r"Loading stream configuration|Scene collection: '?(.*?)'?$", txt)
         if "Switched to scene collection" in txt or txt.startswith("Loading scene collection"):
             coleccion = txt.split("'")[1] if "'" in txt else coleccion
+        if grabando and re.search(r"output adv_file_output paused", txt):
+            pausado_desde = t
+            pausas.append(round(t - t0 - en_pausa, 3))
+        elif grabando and re.search(r"output adv_file_output unpaused", txt) and pausado_desde is not None:
+            en_pausa += t - pausado_desde
+            pausado_desde = None
         me = rx_esc.search(txt)
         if me:
             if grabando:
-                eventos.append({"desde": round(t - t0, 3), "escena": me.group(1)})
+                desde = round((pausado_desde if pausado_desde is not None else t) - t0 - en_pausa, 3)
+                if eventos and eventos[-1]["desde"] == desde:
+                    eventos.pop()                       # varios cambios en una misma pausa: cuenta el ultimo
+                eventos.append({"desde": desde, "escena": me.group(1)})
             else:
                 escena = me.group(1)
         if "==== Recording Start" in txt:
@@ -135,7 +146,7 @@ def escenas_del_log(log: Path, guia: Path) -> tuple[list[dict], str | None]:
             eventos = [{"desde": 0.0, "escena": escena or "?"}]
         elif grabando and "==== Recording Stop" in txt:
             break
-    return eventos, coleccion
+    return eventos, coleccion, pausas
 
 
 # ── coleccion de escenas: el circulo de la camara ───────────────────────────
@@ -214,23 +225,12 @@ def ingesta(guia: Path, edit: Path) -> None:
                         "-c:a", "pcm_s16le", str(wav)], check=True)
         print(f"  mic16k.wav desde la guia")
 
-    # desfases por audio (los primeros 2 min bastan: el desfase es constante)
-    g = mono16k(guia, 120)
-    desf = {}
-    for k in SUFIJOS:
-        d, c = desfase(g, mono16k(archivos[k], 120))
-        if c < 0.5:
-            sys.exit(f"el audio de {archivos[k].name} no se parece al de la guia (correlacion {c:.2f}): "
-                     "revisa que el filtro grabe la pista 1 (o All)")
-        desf[k] = round(d, 4)
-        print(f"  desfase {k}: {d * 1000:+.1f} ms ({d * FPS:+.1f} cuadros, correlacion {c:.2f})")
-
     # escenas del log de OBS
     log = buscar_log(guia)
-    escenas, mapa_esc = [], {}
+    escenas, mapa_esc, pausas = [], {}, []
     if log:
         shutil.copy2(log, edit / "obs_log.txt")
-        escenas, _ = escenas_del_log(log, guia)
+        escenas, _, pausas = escenas_del_log(log, guia)
         for e in escenas:
             mapa_esc.setdefault(e["escena"], vista_de_escena(e["escena"]))
             e["vista"] = mapa_esc[e["escena"]]
@@ -242,13 +242,36 @@ def ingesta(guia: Path, edit: Path) -> None:
               "(se puede editar fuentes.json o cambiar la vista en Studio)")
         escenas = [{"desde": 0.0, "escena": "?", "vista": "camara"}]
 
+    # desfases por audio. Cada pausa puede correr un cuadro el Source Record respecto a la guia (2026-10-26:
+    # 166.7 -> 133.3 ms tras la 3a de 10), asi que se mide al inicio y despues de cada pausa, y se usa el MENOR:
+    # con el error a ese lado la imagen va adelantada al audio, que es lo que menos se nota (<= ~125 ms).
+    ventanas = [0.0] + [p + 5 for p in pausas]
+    guias = {w: mono16k(guia, 120 if w == 0 else 40, w) for w in ventanas}
+    desf, tramos = {}, {}
+    for k in SUFIJOS:
+        medidos = []
+        for w in ventanas:
+            d, c = desfase(guias[w], mono16k(archivos[k], 120 if w == 0 else 40, w))
+            if w == 0 and c < 0.5:
+                sys.exit(f"el audio de {archivos[k].name} no se parece al de la guia (correlacion {c:.2f}): "
+                         "revisa que el filtro grabe la pista 1 (o All)")
+            if c >= 0.5:
+                medidos.append({"desde": round(w, 2), "s": round(d, 4)})
+        desf[k] = min(m["s"] for m in medidos)
+        valores = sorted({m["s"] for m in medidos})
+        print(f"  desfase {k}: {desf[k] * 1000:+.1f} ms ({desf[k] * FPS:+.1f} cuadros; {len(medidos)} mediciones)")
+        if len(valores) > 1:
+            tramos[k] = medidos
+            print(f"    aviso: cambia tras las pausas ({', '.join(f'{v * 1000:+.1f}' for v in valores)} ms); "
+                  f"error maximo {(valores[-1] - valores[0]) * 1000:.0f} ms con la imagen adelantada")
+
     escena_pip = next((e for e, v in mapa_esc.items() if v == "pantalla_camara"), None)
     pip = pip_de_obs(escena_pip) if escena_pip else dict(PIP_DEFECTO, de="medido 2026-10-23")
     print(f"  circulo: centro ({pip['cx']}, {pip['cy']}), {pip['d']} px; camara {pip['recorte']} ({pip['de']})")
 
     f = {"guia": str(guia).replace("\\", "/"),
          "archivos": {k: str(p).replace("\\", "/") for k, p in archivos.items() if k != "guia"},
-         "desfase": desf, "escenas": escenas, "vistas_por_escena": mapa_esc, "pip": pip,
+         "desfase": desf, **({"desfase_tramos": tramos} if tramos else {}), "escenas": escenas, "vistas_por_escena": mapa_esc, "pip": pip,
          "log": "obs_log.txt" if log else None, "generado": datetime.now().isoformat(timespec="seconds")}
     (edit / "fuentes.json").write_text(json.dumps(f, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  -> {edit / 'fuentes.json'}")
