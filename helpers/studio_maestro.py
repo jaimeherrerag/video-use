@@ -546,6 +546,17 @@ def from_studio(edit: Path, dry: bool) -> None:
         clip_attrs.append(a)
         t_out += du
 
+    # Studio dibuja en dos filas los clips encimados y su ripple solo recorre una: el timeline se
+    # desordena y el preview deja de ser la salida (2026-10-27, 0.8.140)
+    encimados = sum(1 for x, y in zip(wins, wins[1:]) if y[0] < x[1] - 0.05)
+    if encimados:
+        notas.append(f"  OJO {encimados} clips encimados en Studio: en el preview el de encima tapaba al otro, "
+                     "pero la salida pone cada clip completo")
+    for k in range(len(orig_idx) - 1):
+        if orig_idx[k + 1] < orig_idx[k]:
+            notas.append(f"  OJO orden: el clip {orig_idx[k] + 1} quedo antes que el {orig_idx[k + 1] + 1} "
+                         "-> ¿reordenado a proposito o encimado sin querer?")
+
     def a_salida(ts: float) -> float:
         """Tiempo de Studio -> tiempo de salida (sin los huecos que dejan los recortes)."""
         for s0, s1, o0, _, _ in wins:

@@ -333,8 +333,32 @@ def main() -> int:
             unido = {"source": args.key,
                      "start": round(min(c["desde"], dentro[0]["start"]), 3),
                      "end": round(max(c["hasta"], dentro[-1]["end"]), 3),
-                     "_words": [j for r in dentro for j in r["_words"]]}
+                     "_words": [j for r in dentro for j in r["_words"]], "_continuo": True}
             ranges = ranges[:k] + [unido] + [r for r in ranges[k:] if r not in dentro]
+
+    # Silencio puro >= 0.5 s DENTRO de un range: WhisperX estira una word sobre la pausa
+    # ("Entonces," declarada 2.0 s con 1.5 s de silencio) y entre words no queda hueco que
+    # cortar; Jaime los corto a mano en Studio (2026-10-27). Aqui los blips cuentan como voz:
+    # contados como silencio partian palabras con consonantes suaves ("espectacular").
+    partidos = []
+    for r in ranges:
+        if r.pop("_continuo", False):
+            partidos.append(r)
+            continue
+        voz = V.runs_voz(db, r["start"], r["end"])
+        bordes = [r["start"]] + [x for q in voz for x in q] + [r["end"]]
+        cortes = [(bordes[k], bordes[k + 1]) for k in range(2, len(bordes) - 3, 2)
+                  if bordes[k + 1] - bordes[k] >= PAUSA_CORTE]
+        # cada word va con la parte donde cae su centro (una word estirada sobre el silencio,
+        # con la que la sigue)
+        lim = [r["start"]] + [q0 + TAIL for q0, _ in cortes] + [r["end"] + 1]
+        ini = [r["start"]] + [q1 - HEAD for _, q1 in cortes]
+        fin = [q0 + TAIL for q0, _ in cortes] + [r["end"]]
+        for p in range(len(ini)):
+            partidos.append({**r, "start": round(ini[p], 3), "end": round(fin[p], 3),
+                             "_words": [j for j in r["_words"]
+                                        if (p == 0 or sum(cov[j]) / 2 >= lim[p]) and sum(cov[j]) / 2 < lim[p + 1]]})
+    ranges = partidos
 
     for r in ranges:
         texto = " ".join(V.txt(ws[j]) for j in r.pop("_words"))
