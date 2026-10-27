@@ -149,6 +149,9 @@ def pip_de_obs(escena_pip: str | None) -> dict:
         cols = sorted((OBS / "basic" / "scenes").glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
         d = json.loads(cols[0].read_text(encoding="utf-8"))
         lw, lh = d["resolution"]["x"], d["resolution"]["y"]
+        # la coleccion es la de AHORA: si el lienzo cambio despues de grabar (vertical para shorts), no sirve
+        if abs(lw / lh - SALIDA[0] / SALIDA[1]) > 0.01:
+            raise ValueError(f"el lienzo actual de OBS es {lw}x{lh}, no 16:9")
         fuentes = {s["name"]: s for s in d["sources"]}
         esc = fuentes[escena_pip]
         item = next(it for it in esc["settings"]["items"]
