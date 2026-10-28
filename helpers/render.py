@@ -162,7 +162,8 @@ def nvenc_available() -> bool:
 
 
 def video_codec_args(
-    *, nvenc: bool, draft: bool = False, preview: bool = False, high_quality: bool = False
+    *, nvenc: bool, draft: bool = False, preview: bool = False, high_quality: bool = False,
+    intermedio: bool = False,
 ) -> list[str]:
     """Bloque de códec de video para los encodes de segmento.
 
@@ -203,6 +204,13 @@ def video_codec_args(
         preset, crf = "ultrafast", "28"
     elif preview:
         preset, crf = "medium", "22"
+    elif intermedio:
+        # --pcm: salida intermedia (stitch_final o la base del slot re-encodean despues). Medido 2026-10-28
+        # contra un render lossless: veryfast/crf14 iguala o supera a slow/crf17 (VMAF 95.9 vs 95.5, SSIM
+        # 0.9991 vs 0.9986) en ~35% menos tiempo; crf16-17 ya quedan debajo. GOP 6 = lo que HF necesita,
+        # asi build_final copia el video a la base del slot sin re-encodear.
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p",
+                "-g", "6", "-keyint_min", "6", "-sc_threshold", "0"]
     elif high_quality:
         preset, crf = "slow", "17"
     else:
@@ -338,6 +346,7 @@ def extract_segment(
     sujeto: dict | None = None,
     audio_de: tuple[Path, float] | None = None,
     fundidos: tuple[bool, bool] = (True, True),
+    intermedio: bool = False,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -366,7 +375,7 @@ def extract_segment(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     vcodec = video_codec_args(
-        nvenc=nvenc, draft=draft, preview=preview, high_quality=high_quality
+        nvenc=nvenc, draft=draft, preview=preview, high_quality=high_quality, intermedio=intermedio
     )
 
     # 30ms audio fades at both edges (Rule 3) — prevent pops.
@@ -577,17 +586,30 @@ def mascara_circulo(d: int, carpeta: Path) -> Path:
 def _segmento_pip(pantalla: Path, t_pant: float, camara: Path, t_cam: float, duration: float, pip: dict,
                   grade_filter: str, censor: list | None, zoom: dict | None, mono: str | None,
                   audio_de: tuple[Path, float], af: str, vcodec: list, fps: int, draft: bool,
-                  out_path: Path, cache: Path) -> None:
+                  out_path: Path, cache: Path, reframe: dict | None = None) -> None:
     """Vista pantalla_camara (grabacion separada): la pantalla a cuadro completo y encima la camara en un
     circulo, como la escena "Pantalla + webcam" de OBS. pip = {cx, cy, d, recorte: {x, y, w, h}} en px del
-    lienzo 1920x1080 (el recorte, en px de la camara). Un solo encode; el audio sale de la guia."""
+    lienzo 1920x1080 (el recorte, en px de la camara). Un solo encode; el audio sale de la guia.
+    `reframe` (fit "place", el que sale de Studio) encuadra la PANTALLA antes de poner el circulo: p.ej. quitar
+    las pestanas de Chrome sin escalar, centrada con franjas negras (largo del CRM, 2026-10-28)."""
     ow, oh = (1280, 720) if draft else (1920, 1080)
     k = ow / 1920
     d = max(2, int(round(pip["d"] * k)) // 2 * 2)
     x, y = int(round(pip["cx"] * k - d / 2)), int(round(pip["cy"] * k - d / 2))
     rc = pip["recorte"]
     base = [censor_chain(censor)] if censor else []
-    base.append(zoom_chain(zoom, ow, oh, fps) if zoom else f"scale={ow}:{oh}:flags=lanczos")
+    if reframe:
+        if reframe.get("fit") != "place":
+            raise ValueError(f"pantalla_camara solo acepta reframe fit 'place', no {reframe.get('fit')!r}")
+        sc, dd = reframe["src_crop"], reframe["dst"]
+        kk = ow / int(reframe.get("out_size", {"w": 1920})["w"])
+        dx, dy = int(dd["x"] * kk), int(dd["y"] * kk)
+        dw, dh = max(2, int(dd["w"] * kk) // 2 * 2), max(2, int(dd["h"] * kk) // 2 * 2)
+        dw, dh = min(dw, ow - dx), min(dh, oh - dy)
+        base.append(f"crop={int(sc['w'])}:{int(sc['h'])}:{int(sc['x'])}:{int(sc['y'])},"
+                    f"scale={dw}:{dh}:flags=lanczos,pad={ow}:{oh}:{dx}:{dy}:black")
+    else:
+        base.append(zoom_chain(zoom, ow, oh, fps) if zoom else f"scale={ow}:{oh}:flags=lanczos")
     cam_grade = f",{grade_filter}" if grade_filter else ""     # el grade es de la camara, no de la pantalla
     fin = f",{mono_filter(mono)}" if mono else ""
     fc = (f"[0:v]{','.join(base)}[bg];"
@@ -623,6 +645,7 @@ def extract_all_segments(
     fps: int = 24,
     high_quality: bool = False,
     nvenc: bool = False,
+    intermedio: bool = False,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -732,8 +755,8 @@ def extract_all_segments(
                            cola_audio(duration)])
             _segmento_pip(vpath, vstart, cam_path, cam_start, duration, pip, seg_filter, r.get("censor"), zoom,
                           mono, audio_de, af, video_codec_args(nvenc=nvenc, draft=draft, preview=preview,
-                                                               high_quality=high_quality),
-                          fps, draft, out_path, root / "assets_fuentes")
+                                                               high_quality=high_quality, intermedio=intermedio),
+                          fps, draft, out_path, root / "assets_fuentes", reframe=reframe)
         else:
             extract_segment(
                 vpath, vstart, duration, seg_filter, out_path,
@@ -741,7 +764,7 @@ def extract_all_segments(
                 fps=fps, high_quality=high_quality, nvenc=nvenc,
                 audio_filter=audio_filter, censor=r.get("censor"),
                 zoom=zoom, mono=mono, sujeto=sujeto,
-                audio_de=audio_de, fundidos=fundidos,
+                audio_de=audio_de, fundidos=fundidos, intermedio=intermedio,
             )
         seg_paths.append(out_path)
 
@@ -1239,7 +1262,8 @@ def main() -> None:
         "--pcm",
         action="store_true",
         help="Salida INTERMEDIA para el stitch: overlays compuestos, audio PCM, sin "
-             "loudnorm ni speed (eso lo hace stitch_final.py una sola vez al final).",
+             "loudnorm ni speed (eso lo hace stitch_final.py una sola vez al final). "
+             "Video x264 veryfast/crf14 con GOP 6 (ignora --high-quality).",
     )
     args = ap.parse_args()
 
@@ -1278,7 +1302,7 @@ def main() -> None:
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
         edl, edit_dir, preview=args.preview, draft=args.draft,
-        fps=args.fps, high_quality=args.high_quality, nvenc=args.nvenc,
+        fps=args.fps, high_quality=args.high_quality, nvenc=args.nvenc, intermedio=args.pcm,
     )
 
     # 2. Concat → base
@@ -1311,6 +1335,10 @@ def main() -> None:
         # Intermedio para stitch_final.py: PCM, sin loudnorm (una sola generación AAC al final)
         build_final_composite(base_path, overlays, subs_path, out_path, edit_dir,
                               encode_audio=False, nvenc=args.nvenc, speed=1.0)
+        # el base y los segmentos ya estan en la salida y se rehacen en cada corrida; con el x264 intermedio
+        # (~2x de pesado) dejarlos ocupaba ~4 GB mas de C: por largo
+        for p in [base_path, *segment_paths]:
+            p.unlink(missing_ok=True)
     elif args.no_loudnorm:
         # Composite directly to final output → salida terminal, encodear AAC aquí
         # (base.mp4 trae PCM; sin loudnorm este es el único encode lossy).
