@@ -32,6 +32,7 @@ de la cabeza: 3).
 
     to-studio   --edit-dir E [--force]   EDL + stitch.json + slots -> E/studio/
     from-studio --edit-dir E [--dry-run] Studio -> edl.json, stitch.json, slots (con respaldos)
+    ordenar     --edit-dir E [--dry-run] from-studio + to-studio: tras recortar o extender en Studio
 
 Studio reproduce a 1x (el entregable va a `speed`). Recortar un clip en Studio deja hueco
 (no hace ripple): todo tiempo de Studio se convierte al timeline de SALIDA por el clip que
@@ -506,6 +507,20 @@ def from_studio(edit: Path, dry: bool) -> None:
         if tag == "video" and "data-range" in a and not oculto(a):
             clips.append(a)
     clips.sort(key=lambda a: (float(a.get("data-start", 0)), a["_order"]))
+    # Studio no hace ripple al recortar ni al extender: el clip queda encimado y Studio parte la pista en
+    # filas (por id, no por tiempo); "cerrar huecos" y arrastrar mueven una sola fila y el orden por
+    # data-start voltea clips. Entre dos clips encimados manda el orden original (2026-10-27)
+    def orden_original(a):
+        return int(a["data-range"]), float(a.get("data-media-start", 0))
+    volteo = True
+    while volteo:
+        volteo = False
+        for k in range(len(clips) - 1):
+            x, y = clips[k], clips[k + 1]
+            if (float(y.get("data-start", 0)) < float(x.get("data-start", 0)) + float(x["data-duration"]) - 0.05
+                    and orden_original(y) < orden_original(x)):
+                clips[k], clips[k + 1] = y, x
+                volteo = True
     fsep = mapa.get("fuentes")
     ranges, wins, notas, t_out = [], [], [], 0.0
     orig_idx, clip_attrs = [], []                   # por range nuevo: su range original y su <video>
@@ -788,7 +803,7 @@ def from_studio(edit: Path, dry: bool) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["to-studio", "from-studio"])
+    ap.add_argument("cmd", choices=["to-studio", "from-studio", "ordenar"])
     ap.add_argument("--edit-dir", required=True, type=Path)
     ap.add_argument("--force", action="store_true", help="to-studio: descartar cambios sin exportar")
     ap.add_argument("--dry-run", action="store_true", help="from-studio: solo reportar")
@@ -796,6 +811,12 @@ def main() -> int:
     edit = args.edit_dir.resolve()
     if args.cmd == "to-studio":
         to_studio(edit, args.force)
+    elif args.cmd == "ordenar":
+        # despues de recortar o extender en Studio: los cambios al EDL y el timeline regenerado, contiguo y
+        # con los circulos alineados (Studio recarga solo)
+        from_studio(edit, args.dry_run)
+        if not args.dry_run:
+            to_studio(edit, False)
     else:
         from_studio(edit, args.dry_run)
     return 0
