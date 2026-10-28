@@ -105,7 +105,9 @@ def cadena_voz(parts, speed: float) -> tuple[list[str], list[str], int]:
     inputs, fc = [], []
     for k, (_, a, d) in enumerate(parts):
         inputs += ["-i", str(a)]
-        fc.append(f"[{k}:a:0]atrim=0:{d:.3f},asetpts=PTS-STARTPTS,aresample=48000[p{k}]")
+        # apad: si el audio de una parte quedara corto, el concat lo pegaria antes de tiempo y la voz de
+        # todas las partes siguientes iria adelantada a la imagen
+        fc.append(f"[{k}:a:0]apad,atrim=0:{d:.3f},asetpts=PTS-STARTPTS,aresample=48000[p{k}]")
     n = len(parts)
     fc.append("".join(f"[p{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1"
               + (f",atempo={speed:g}" if abs(speed - 1) > 1e-6 else "") + "[voz]")

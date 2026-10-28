@@ -305,6 +305,20 @@ def mono_expr_rango(color: dict | None, source: str, start: float, end: float) -
     return f"{base:.0f}" + "".join(terms)
 
 
+def cola_audio(duration: float) -> str:
+    """Cierre del filtro de audio: rellena con silencio y recorta al sample, para que el audio del segmento
+    dure EXACTO lo del EDL. `-shortest` no lo garantizaba: con la guia como segunda entrada dejaba el audio
+    hasta un cuadro mas corto que el video, el concat (MP4) borraba ese hueco y el audio se adelantaba ~1 s al
+    final de un largo (segundo cerebro, 2026-10-28)."""
+    return f"apad,atrim=duration={duration:.6f}"
+
+
+def cola_video(duration: float, fps: int) -> str:
+    """Cierre del filtro de video: el piso de la rejilla de cuadros, para que el video nunca dure mas que su
+    audio. Va como filtro (`trim`) y no como `-frames:v`/`-shortest`: esos cierran la salida y cortan el audio."""
+    return f"fps={fps},trim=end_frame={max(1, int(duration * fps + 1e-6))}"
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -356,13 +370,12 @@ def extract_segment(
     )
 
     # 30ms audio fades at both edges (Rule 3) — prevent pops.
-    # `apad` + `-shortest` (below) trim audio to EXACTLY the frame-quantized video
-    # duration so per-segment A/V durations match. Without this, video (discrete
-    # frames) and audio (exact samples) drift a few ms/segment, accumulating into
-    # progressive audio desync across a long concat. See CLAUDE.md.
+    # Audio EXACTO a la duracion del EDL y video al piso de la rejilla (`cola_audio` y `cuadros`): asi el
+    # concat avanza siempre lo que dura el audio y ningun segmento se come el audio de los siguientes.
     fade_out_start = max(0.0, duration - 0.03)
     af = ",".join([*(["afade=t=in:st=0:d=0.03"] if fundidos[0] else []),
-                   *([f"afade=t=out:st={fade_out_start:.3f}:d=0.03"] if fundidos[1] else []), "apad"])
+                   *([f"afade=t=out:st={fade_out_start:.3f}:d=0.03"] if fundidos[1] else []),
+                   cola_audio(duration)])
     # audio de la guia (grabacion separada): segunda entrada; el video sigue saliendo de `source`
     ent_audio = ["-ss", f"{audio_de[1]:.3f}", "-i", str(audio_de[0])] if audio_de else []
     # Filtro de audio opcional (ej. denoise) ANTES de fades/apad, en la etapa PCM.
@@ -409,6 +422,7 @@ def extract_segment(
             return
         if mono:
             vf = f"{vf},{mono_filter(mono)}"
+        vf = f"{vf},{cola_video(duration, fps)}"
 
         cmd = [
             "ffmpeg", "-y",
@@ -422,7 +436,6 @@ def extract_segment(
             *vcodec, "-r", str(fps),
             # PCM lossless: el único encode AAC ocurre al final (loudnorm). Ver FINAL_AAC_BITRATE.
             "-c:a", "pcm_s16le", "-ar", "48000",
-            "-shortest",
             "-movflags", "+faststart",
             str(out_path),
         ]
@@ -496,6 +509,7 @@ def extract_segment(
             f"[bg][fg]overlay=x=0:y={y_expr}:format=auto[outv]"
         )
 
+    fc = fc.replace("[outv]", f",{cola_video(duration, fps)}[outv]", 1)
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
@@ -512,7 +526,6 @@ def extract_segment(
         *vcodec, "-r", str(fps),
         # PCM lossless: el único encode AAC ocurre al final (loudnorm). Ver FINAL_AAC_BITRATE.
         "-c:a", "pcm_s16le", "-ar", "48000",
-        "-shortest",
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -540,12 +553,11 @@ def _segmento_con_sujeto(source: Path, seg_start: float, duration: float, vf_cam
     fc = (f"[0:v]{vf_cam}[cam];{fondo}"
           f"[1:v]scale={ow}:{oh}:flags=lanczos,format=yuva420p[sj];"
           f"[cam][bg]overlay=0:0:enable='{ventana}':eof_action=pass[c1];"
-          f"[c1][sj]overlay=0:0:enable='{ventana}':eof_action=pass:format=auto,format=yuv420p{fin}[outv]")
+          f"[c1][sj]overlay=0:0:enable='{ventana}':eof_action=pass:format=auto,format=yuv420p{fin},{cola_video(duration, fps)}[outv]")
     n_audio = 3 if sj.get("img") else 2              # la guia (si viene) entra despues de camara, recorte y fondo
     cmd += [*(ent_audio or []), "-t", f"{duration:.3f}", "-filter_complex", fc, "-map", "[outv]",
             "-map", f"{n_audio}:a:0" if ent_audio else "0:a:0",
-            "-af", af, *vcodec, "-r", str(fps), "-c:a", "pcm_s16le", "-ar", "48000", "-shortest",
-            "-movflags", "+faststart", str(out_path)]
+            "-af", af, *vcodec, "-r", str(fps), "-c:a", "pcm_s16le", "-ar", "48000", "-movflags", "+faststart", str(out_path)]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -581,13 +593,12 @@ def _segmento_pip(pantalla: Path, t_pant: float, camara: Path, t_cam: float, dur
     fc = (f"[0:v]{','.join(base)}[bg];"
           f"[1:v]crop={rc['w']}:{rc['h']}:{rc['x']}:{rc['y']},scale={d}:{d}:flags=lanczos{cam_grade},format=rgba[c0];"
           f"[2:v]format=gray,scale={d}:{d}[m];[c0][m]alphamerge[c];"
-          f"[bg][c]overlay={x}:{y}:format=auto,format=yuv420p{fin}[outv]")
+          f"[bg][c]overlay={x}:{y}:format=auto,format=yuv420p{fin},{cola_video(duration, fps)}[outv]")
     cmd = ["ffmpeg", "-y", "-ss", f"{t_pant:.3f}", "-i", str(pantalla), "-ss", f"{t_cam:.3f}", "-i", str(camara),
            "-loop", "1", "-i", str(mascara_circulo(int(round(pip["d"])), cache)),
            "-ss", f"{audio_de[1]:.3f}", "-i", str(audio_de[0]),
            "-t", f"{duration:.3f}", "-filter_complex", fc, "-map", "[outv]", "-map", "3:a:0",
-           "-af", af, *vcodec, "-r", str(fps), "-c:a", "pcm_s16le", "-ar", "48000", "-shortest",
-           "-movflags", "+faststart", str(out_path)]
+           "-af", af, *vcodec, "-r", str(fps), "-c:a", "pcm_s16le", "-ar", "48000", "-movflags", "+faststart", str(out_path)]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -717,7 +728,8 @@ def extract_all_segments(
             fade_out_start = max(0.0, duration - 0.03)
             af = ",".join([*([audio_filter] if audio_filter else []),
                            *(["afade=t=in:st=0:d=0.03"] if fundidos[0] else []),
-                           *([f"afade=t=out:st={fade_out_start:.3f}:d=0.03"] if fundidos[1] else []), "apad"])
+                           *([f"afade=t=out:st={fade_out_start:.3f}:d=0.03"] if fundidos[1] else []),
+                           cola_audio(duration)])
             _segmento_pip(vpath, vstart, cam_path, cam_start, duration, pip, seg_filter, r.get("censor"), zoom,
                           mono, audio_de, af, video_codec_args(nvenc=nvenc, draft=draft, preview=preview,
                                                                high_quality=high_quality),
@@ -756,6 +768,16 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
     print(f"concat → {out_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     concat_list.unlink(missing_ok=True)
+
+    # Sincronia: el audio debe durar lo mismo que el video o hasta un cuadro mas (la cola del ultimo
+    # segmento). Si es mas corto, el concat borro huecos de audio y la voz se adelanta a la imagen.
+    def _dur(sel: str) -> float:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", sel, "-show_entries",
+                              "stream=duration", "-of", "csv=p=0", str(out_path)], capture_output=True, text=True)
+        return float(out.stdout.strip().splitlines()[0])
+    dv, da = _dur("v:0"), _dur("a:0")
+    if not -0.002 <= da - dv < 0.05:
+        sys.exit(f"desfase de audio en {out_path.name}: video {dv:.3f}s, audio {da:.3f}s ({da - dv:+.3f}s)")
 
 
 # -------- Master SRT (Rule 5) ------------------------------------------------
