@@ -275,7 +275,9 @@ def to_studio(edit: Path, force: bool) -> None:
                                    for c in e["copias"]]} for e in trans]
     lines += html_color(trans_html, looks, proxies, css_clip, etiqueta)
 
-    # blurs: un rectangulo por censor y por range, en coordenadas del lienzo
+    # blurs: un rectangulo por censor y por range, en coordenadas del lienzo. Llevan el data-zclip de su clip:
+    # render.py difumina ANTES del zoom, asi que en Studio el rectangulo escala con la imagen (zoom sostenido que
+    # recorta las pestanas, largo del CRM 2026-10-28); sin eso quedaba corrido hasta ~30 px de lo que tapa
     nb = 0
     for i, r in enumerate(edl["ranges"]):
         for c in r.get("censor") or []:
@@ -284,7 +286,7 @@ def to_studio(edit: Path, force: bool) -> None:
             x, y, wd, ht = fuente_a_lienzo(place, (c["x"], c["y"], c["w"], c["h"]), sw, sh, CW, CH)
             nb += 1
             lines.append(
-                f'    <div id="blur-{nb:02d}" class="clip blur-censura" data-timeline-label="Blur {nb} (censura)"\n'
+                f'    <div id="blur-{nb:02d}" class="clip blur-censura" data-zclip="{i}" data-timeline-label="Blur {nb} (censura)"\n'
                 f'      data-start="{t0:.3f}" data-duration="{t1 - t0:.3f}" data-track-index="1"\n'
                 f'      style="position: absolute; left: {x:.1f}px; top: {y:.1f}px; width: {wd:.1f}px; '
                 f'height: {ht:.1f}px;"></div>')

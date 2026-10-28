@@ -7,7 +7,7 @@ con origen en `origen` (px del lienzo; por defecto la cara). Es propiedad del cl
 recortes y partidas. En Studio se ve animado y aparece como una marca "Zoom · 1.00->1.08" en el timeline:
 moverla o recortarla cambia cuando pasa, borrarla lo quita (regla de oro, 2026-10-13).
 
-Todo lo que se dibuja con la camara de un clip (sus copias de color y su recorte de sujeto) lleva
+Todo lo que se dibuja con la camara de un clip (sus copias de color, su recorte de sujeto y sus blurs) lleva
 `data-zclip="<i>"` y escala igual, para que no se despeguen. Solo en clips sin `reframe` (el encuadre
 fijo ya usa translate/clip-path; zoom y encuadre a la vez no se representan todavia).
 """
@@ -64,7 +64,9 @@ JS = """    // zooms (zooms_studio.py): cada marca escala la camara de su clip (
       const objetivos = document.querySelectorAll('[data-zclip="' + m.getAttribute("data-zoom") + '"]');
       if (!objetivos.length) return;
       const [ox, oy] = (m.getAttribute("data-origen") || "540 760").split(" ");
-      tl.fromTo(objetivos, { scale: parseFloat(m.getAttribute("data-de")), transformOrigin: ox + "px " + oy + "px" },
+      // origen en px del lienzo -> en la caja de cada objetivo (un blur no empieza en 0,0)
+      const origen = (k, el) => (ox - el.offsetLeft) + "px " + (oy - el.offsetTop) + "px";
+      tl.fromTo(objetivos, { scale: parseFloat(m.getAttribute("data-de")), transformOrigin: origen },
                 { scale: parseFloat(m.getAttribute("data-a")), duration: parseFloat(m.getAttribute("data-duration")),
                   ease: m.getAttribute("data-ease") || "power1.inOut" }, parseFloat(m.getAttribute("data-start")));
     });
