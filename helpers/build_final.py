@@ -249,7 +249,13 @@ def main() -> int:
         txt = json.dumps(sub, ensure_ascii=False, indent=2)
         (d / "edl.json").write_text(txt, encoding="utf-8")
         pcm = d / f"{tr['nombre']}_pcm.mp4"
-        firma = hashlib.sha1((txt + sha_de(*[(edit / o["file"]) for o in edl.get("overlays") or []])).encode()).hexdigest()
+        # firma con las claves ordenadas: from-studio y los generadores escriben las mismas claves en otro orden
+        # (p. ej. zoom src/origen) y con el texto tal cual se re-renderizaba todo sin cambios reales (2026-10-28)
+        ov_sha = sha_de(*[(edit / o["file"]) for o in edl.get("overlays") or []])
+        firma = hashlib.sha1((json.dumps(sub, ensure_ascii=False, sort_keys=True) + ov_sha).encode()).hexdigest()
+        legado = hashlib.sha1((txt + ov_sha).encode()).hexdigest()
+        if (d / ".edl.sha1").exists() and (d / ".edl.sha1").read_text().strip() == legado:
+            (d / ".edl.sha1").write_text(firma)     # firma del formato anterior: se migra sin re-renderizar
         if cambio(d / ".edl.sha1", firma, args.forzar) or not pcm.exists():
             print(f"tramo {tr['nombre']}: render.py --pcm")
             run(PY + [HELP / "render.py", d / "edl.json", "-o", pcm, "--fps", fps, "--high-quality",
