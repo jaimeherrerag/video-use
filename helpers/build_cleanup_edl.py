@@ -360,6 +360,17 @@ def main() -> int:
                                         if (p == 0 or sum(cov[j]) / 2 >= lim[p]) and sum(cov[j]) / 2 < lim[p + 1]]})
     ranges = partidos
 
+    # Bloques grabados fuera de lugar ("me olvide de mostrar el pricing, aqui grabo una seccion
+    # para moverla", largo del CRM 2026-10-28): "mover" en cleanup_overrides.json, por tiempo de
+    # SOURCE. Los ranges cuyo centro cae en [desde, hasta] pasan antes del primero que empieza
+    # en o despues de "antes_de". Studio muestra el orden nuevo y from-studio lo respeta.
+    if ov_path.exists():
+        for mv in ov.get("mover", []):
+            bloque = [r for r in ranges if mv["desde"] <= (r["start"] + r["end"]) / 2 <= mv["hasta"]]
+            resto = [r for r in ranges if r not in bloque]
+            k = next((i for i, r in enumerate(resto) if r["start"] >= mv["antes_de"]), len(resto))
+            ranges = resto[:k] + bloque + resto[k:]
+
     for r in ranges:
         texto = " ".join(V.txt(ws[j]) for j in r.pop("_words"))
         r["beat"] = texto if len(texto) <= 90 else texto[:87] + "..."
@@ -382,10 +393,9 @@ def main() -> int:
 
     def out_de(t: float) -> float:
         """Output-time del punto de corte mas cercano a t (source)."""
-        for k, r in enumerate(ranges):
-            if r["start"] >= t:
-                return outs[k]
-        return cum
+        # por source, no por orden de la lista: con "mover" los ranges ya no van en orden
+        sig = [k for k, r in enumerate(ranges) if r["start"] >= t]
+        return outs[min(sig, key=lambda k: ranges[k]["start"])] if sig else cum
 
     lineas = [f"# Reporte de cleanup — {args.source.name}", "",
               f"- Fuente: {V.fmt_t(len(db) * STEP)} → salida **{V.fmt_t(cum)}** "
