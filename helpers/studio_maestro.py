@@ -773,7 +773,9 @@ def from_studio(edit: Path, dry: bool) -> None:
         txt = idx.read_text(encoding="utf-8")
 
         for hid, st, du, src, info in hs:
-            txt = re.sub(rf'(id="{re.escape(hid)}"[^>]*?data-start=")[\d.]+(")', rf"\g<1>{st:.3f}\g<2>", txt, count=1)
+            # max(0.0, ...): la resta contra el t del slot puede dar -1e-12, que se escribe "-0.000" y rompe a quien lee
+            # data-start (build_final se cayó así el 2026-10-28)
+            txt = re.sub(rf'(id="{re.escape(hid)}"[^>]*?data-start=")[\d.]+(")', rf"\g<1>{max(0.0, st):.3f}\g<2>", txt, count=1)
             txt = re.sub(rf'(id="{re.escape(hid)}"[^>]*?data-duration=")[\d.]+(")', rf"\g<1>{du:.3f}\g<2>", txt, count=1)
             f = out / info.get("src_maestro", src)
             if editada_en_studio(f, mapa, sp / src):
