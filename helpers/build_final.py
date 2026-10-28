@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -34,6 +35,10 @@ from pathlib import Path
 HELP = Path(__file__).parent
 REPO = HELP.parents[1]
 PY = [sys.executable]
+# HF reparte la captura en 3 Chrome solo con >= 24 GB de RAM, y Windows reporta 23.1 GB en la PC de 24: el slot
+# se quedaba en 1 worker a ~11 cuadros/s. Con 3, ~2.3x mas rapido y la misma salida (medido 2026-10-28); una
+# maquina de 16 GB (donde HF vio franjas negras) sigue en 1 worker.
+HF_ENV = {**os.environ, "HF_DE_PARALLEL_MIN_MEM_MB": "20480"}
 
 
 def sha_de(*paths: Path) -> str:
@@ -55,9 +60,9 @@ def cambio(marca: Path, firma: str, forzar: bool) -> bool:
     return False
 
 
-def run(cmd: list, cwd: Path | None = None) -> None:
+def run(cmd: list, cwd: Path | None = None, env: dict | None = None) -> None:
     print("  $ " + " ".join(str(c) for c in cmd[:6]) + (" ..." if len(cmd) > 6 else ""), flush=True)
-    r = subprocess.run([str(c) for c in cmd], cwd=cwd, shell=False)
+    r = subprocess.run([str(c) for c in cmd], cwd=cwd, shell=False, env=env)
     if r.returncode != 0:
         sys.exit(f"fallo: {' '.join(str(c) for c in cmd)}")
 
@@ -66,6 +71,14 @@ def dur_video(p: Path) -> float:
     out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                           "stream=duration", "-of", "csv=p=0", str(p)], capture_output=True, text=True).stdout
     return float(out.strip().splitlines()[0])
+
+
+def gop_denso(p: Path) -> bool:
+    """True si el video trae un keyframe cada <= 6 cuadros (lo que HF necesita para no congelar el video)."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#30",
+                          "-show_entries", "packet=flags", "-of", "csv=p=0", str(p)], capture_output=True, text=True).stdout
+    k = [i for i, f in enumerate(out.split()) if "K" in f]
+    return len(k) > 1 and max(b - a for a, b in zip(k, k[1:])) <= 6
 
 
 def ventana_slot(edit: Path, s: dict) -> tuple[float, float]:
@@ -274,8 +287,14 @@ def main() -> int:
         sdir = (edit / tr["slot"]["dir"]).resolve()
         base = sdir / "assets" / "base.mp4"
         if cambio(sdir / ".base.sha1", (tr["pcm"].parent / ".edl.sha1").read_text(), args.forzar) or not base.exists():
-            run(["ffmpeg", "-v", "error", "-y", "-i", tr["pcm"], "-c:v", "libx264", "-preset", "slow",
-                 "-crf", "16", "-pix_fmt", "yuv420p", "-g", "6", "-keyint_min", "6", "-sc_threshold", "0",
+            # render.py --pcm ya sale con GOP 6: se copia el video. Re-encodearlo costaba ~45 s por slot y movia
+            # los PTS a la rejilla de 1/30: HF tomaba el cuadro vecino y su render salia hasta 1 cuadro corto, y el
+            # stitch adelantaba el video un cuadro por slot (~100 ms al final del largo del segundo cerebro, 2026-10-28).
+            # Un tramo con overlays (el composite re-encodea sin GOP 6) o de un render.py viejo sigue re-encodeando.
+            vcod = ["-c:v", "copy"] if gop_denso(tr["pcm"]) else \
+                ["-c:v", "libx264", "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p", "-g", "6",
+                 "-keyint_min", "6", "-sc_threshold", "0"]
+            run(["ffmpeg", "-v", "error", "-y", "-i", tr["pcm"], *vcod,
                  "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", base])
             (sdir / ".base.sha1").write_text((tr["pcm"].parent / ".edl.sha1").read_text())
             frases = sdir / "frases.txt"
@@ -303,7 +322,8 @@ def main() -> int:
         if cambio(sdir / ".render.sha1", firma, args.forzar) or not render.exists():
             print(f"slot {tr['nombre']}: render de HyperFrames ({D:.1f}s)")
             npm = ["cmd", "/c", "npm"] if sys.platform == "win32" else ["npm"]
-            run(npm + ["run", "render", "--", "--fps", str(fps), "--quality", "high", "-o", render.name], cwd=sdir)
+            run(npm + ["run", "render", "--", "--fps", str(fps), "--quality", "high", "-o", render.name], cwd=sdir,
+                env=HF_ENV)
             (sdir / ".render.sha1").write_text(firma)
         else:
             print(f"slot {tr['nombre']}: sin cambios, se reutiliza {render.name}")
