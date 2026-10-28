@@ -140,7 +140,8 @@ def build_maestro(edit: Path, edl: dict, spec: dict, spec_path: Path, fps: int, 
             if salida.exists():
                 print("  aviso: cambiaron los cortes -> el karaoke se regenera del transcript "
                       "(las correcciones de texto van en transcripts/, no en subtitles.html)")
-            key = next(r["source"] for r in edl["ranges"])
+            # la primera fuente con transcript: un arranque con el Reel de un tercero no tiene el suyo
+            key = next(r["source"] for r in edl["ranges"] if (edit / "transcripts" / f"{r['source']}.json").exists())
             cmd = PY + [HELP / "build_karaoke.py", "--transcript", edit / "transcripts" / f"{key}.json",
                         "--edl", d / "edl.json", "--template", REPO / k["template"], "--output", salida,
                         "--max-per-pill", str(k.get("max_per_pill", 7))]

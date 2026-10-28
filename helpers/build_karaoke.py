@@ -143,7 +143,10 @@ def pills_de_frases(transcript_path: Path, ranges: list[tuple[float, float]], fr
     `max_per_pill` palabras se parte en varias pills. Devuelve las frases no encontradas.
     """
     words, off = [], 0.0
-    for s, e in ranges:
+    for s, e, *propio in ranges:
+        if propio and not propio[0]:
+            off += e - s
+            continue
         for w in load_words_in_range(transcript_path, s, e):
             words.append({"text": w["text"], "at": w["start"] - s + off,
                           "end": w["end"] - s + off, "tok": _norm(w["text"])})
@@ -236,8 +239,11 @@ def collect_pills_from_ranges(
     out_offset = 0.0
     pill_idx = 0
 
-    for seg_start, seg_end in ranges:
+    for seg_start, seg_end, *propio in ranges:
         seg_duration = seg_end - seg_start
+        if propio and not propio[0]:
+            out_offset += seg_duration
+            continue
         words = load_words_in_range(transcript_path, seg_start, seg_end)
         seg_pills = group_into_pills(
             words, seg_start, seg_duration,
@@ -279,7 +285,10 @@ def main() -> None:
 
     if args.edl:
         edl = json.loads(args.edl.read_text(encoding="utf-8"))
-        ranges = [(float(r["start"]), float(r["end"])) for r in edl["ranges"]]
+        # un range de otra fuente (p. ej. el Reel de un tercero en el arranque) solo corre el reloj: sus palabras
+        # no estan en este transcript y buscarlas ahi pegaria las de la fuente principal en esos tiempos
+        key = args.transcript.stem
+        ranges = [(float(r["start"]), float(r["end"]), r.get("source", key) == key) for r in edl["ranges"]]
     else:
         if args.src_start is None or args.src_end is None:
             raise SystemExit("provide either --edl or both --src-start/--src-end")
