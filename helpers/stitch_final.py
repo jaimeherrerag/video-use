@@ -51,7 +51,8 @@ def dur(path: Path, stream: str) -> float:
     out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries",
                           "stream=duration", "-of", "csv=p=0", str(path)],
                          capture_output=True, text=True).stdout.strip().splitlines()
-    return float(out[0])
+    # los MP3 de Freesound traen un campo vacío de más ("0.166168,")
+    return float(out[0].split(",")[0])
 
 
 def tamano(path: Path) -> tuple[int, int]:
