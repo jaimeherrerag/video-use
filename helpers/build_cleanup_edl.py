@@ -14,6 +14,8 @@ mapa de energia que verify_edl.py (-38 dB, ventanas de 50 ms):
   - repeticiones entre unidades (Preset 3): descarta el primer intento corto
   - corta TODA pausa >= 0.5 s (preferencia 2026-07-13). Las pausas se miden en el
     mapa de energia, no con el end declarado de las words (el ASR las estira)
+  - una palabra dicha sola tras una pausa que el ASR estiro sobre la pausa ("uno,",
+    "2.") conserva su bloque de voz real como corte propio
 
 Uso:
     uv run python helpers/build_cleanup_edl.py --edit-dir <edit> --source <video> [--key raw]
@@ -42,6 +44,8 @@ VENTANA_RETOMA = 45.0       # s hacia atras para buscar donde empezo el intento 
                             # (25 s no alcanzo: hablando mientras dibuja hubo 34 s entre
                             # el inicio del intento y la marca, 2026-10-07)
 SILENCIO_LARGO = 8.0        # silencios cortados mas largos que esto van al reporte
+MARGEN_BLOQUE = 0.10        # margen del corte propio de una palabra dicha sola tras una pausa
+BORDE_WORD = 0.10           # ese bloque tiene que tocar el start o el end declarado de la word
 STEP = V.VENTANA_MS / 1000.0
 FIN_FRASE = re.compile(r"[.?!]$")
 
@@ -70,6 +74,34 @@ def inicio_voz(db, t: float, piso: float) -> float:
     while i - 1 >= i_min and db[i - 1] > V.VOZ_DB:
         i -= 1
     return min(t, i * STEP)
+
+
+def bloque_suelto(ws, cov, db, j: int, drops) -> tuple | None:
+    """Voz real de la word j que su cobertura deja fuera, o None.
+
+    "uno," dicho solo tras una pausa (largo del segundo cerebro, 2026-10-28): WhisperX lo
+    estiro de 1834.58 a 1837.61, cobertura() eligio la cola alargada de "que," y el "uno"
+    real (1837.35-1837.65) caia con la pausa. Solo se rescata el patron limpio: dos bloques
+    en la ventana (la cobertura y este), que toca el borde de la word y dura lo plausible.
+    Con mas habla sin words dentro (en el mismo largo, "varios" tapaba un primer intento y
+    un "Borro eso.") no se toca: eso lo marca verify_edl como bloque-fuera.
+    """
+    w = ws[j]
+    s, e = float(w["start"]), float(w["end"])
+    techo = cov[j + 1][0] - 0.02 if j + 1 < len(ws) else len(db) * STEP
+    bloques = V.bloques_word(w, db, techo)
+    fuera = [b for b in bloques if not (b[0] < cov[j][1] and b[1] > cov[j][0])]
+    if len(bloques) != 2 or len(fuera) != 1:
+        return None
+    b0, b1 = fuera[0]
+    borde = b1 >= e - BORDE_WORD if b0 >= cov[j][1] else b0 <= s + BORDE_WORD
+    if not borde or b1 - b0 > V.dur_esperada(V.txt(w)) * V.MARGEN_CLAMP:
+        return None
+    if any(cov[q][0] < b1 and cov[q][1] > b0 for q in (j - 1, j + 1) if 0 <= q < len(ws)):
+        return None  # es audio de la word vecina
+    if any(o["desde"] <= (b0 + b1) / 2 <= o["hasta"] for o in drops):
+        return None
+    return b0, b1
 
 
 def fin_voz(db, t: float, techo: float) -> float:
@@ -359,6 +391,23 @@ def main() -> int:
                              "_words": [j for j in r["_words"]
                                         if (p == 0 or sum(cov[j]) / 2 >= lim[p]) and sum(cov[j]) / 2 < lim[p + 1]]})
     ranges = partidos
+
+    # Palabra dicha sola tras una pausa que el ASR estiro sobre toda la pausa: su voz real queda
+    # fuera de la cobertura y se iba con la pausa. Va como corte propio, con MARGEN_BLOQUE.
+    drops = ov.get("drop", []) if ov_path.exists() else []
+    for j in vivos:
+        b = bloque_suelto(ws, cov, db, j, drops)
+        if b is None or any(r["start"] < b[1] and r["end"] > b[0] for r in ranges):
+            continue
+        k = next((i for i, r in enumerate(ranges) if r["start"] >= b[1]), len(ranges))
+        s = max(b[0] - MARGEN_BLOQUE, ranges[k - 1]["end"] if k else 0.0)
+        e = min(b[1] + MARGEN_BLOQUE, ranges[k]["start"] if k < len(ranges) else len(db) * STEP)
+        for r in ranges:
+            if j in r["_words"]:
+                r["_words"].remove(j)
+        ranges.insert(k, {"source": args.key, "start": round(s, 3), "end": round(e, 3), "_words": [j]})
+        avisos.append(f"{V.fmt_t(b[0])} '{V.txt(ws[j])}' estirada {float(ws[j]['end']) - float(ws[j]['start']):.1f} s "
+                      f"sobre una pausa: su bloque de voz ({b[1] - b[0]:.2f} s) va como corte propio - revisar de oido")
 
     # Bloques grabados fuera de lugar ("me olvide de mostrar el pricing, aqui grabo una seccion
     # para moverla", largo del CRM 2026-10-28): "mover" en cleanup_overrides.json, por tiempo de

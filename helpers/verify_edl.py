@@ -46,6 +46,8 @@ MARGEN_CLAMP = 2.5       # cuanto puede exceder una word su duracion esperada
 CORTE_VOZ_MIN = 0.10     # voz que sigue (o empezo) mas alla del corte: >=0.10s se come parte de una palabra
                          # antes de considerarla estirada (2.5x deja pasar
                          # URLs y dominios leidos enteros)
+SILENCIO_EN_WORD = 0.50  # silencio puro dentro de una word: el ASR la estiro sobre una pausa
+BLOQUE_VOZ_MIN = 0.15    # bloque de voz dentro de una word estirada: mas corto que esto no es una palabra
 
 # Marcas verbales de corte. "por eso" va aparte: WhisperX transcribe asi un
 # "borra eso" rapido, pero tambien es una locucion legitima -> severidad INFO.
@@ -253,6 +255,27 @@ def cobertura(w, db=None) -> tuple:
     return elegido
 
 
+def bloques_word(w, db, techo: float) -> list[tuple]:
+    """Bloques de habla de una word estirada sobre una pausa ([] si no hay pausa dentro).
+
+    Una palabra corta dicha sola despues de una pausa queda estirada sobre toda la pausa
+    ("uno," declarada 1834.58-1837.61 con la voz en 1837.35-1837.65, largo del segundo
+    cerebro 2026-10-28), y cobertura() se queda con el run mas largo, que ahi era la cola
+    alargada de "que,". Con >= SILENCIO_EN_WORD de silencio dentro (blips fuera) devuelve
+    cada bloque fusionado que empieza en la ventana, dura >= BLOQUE_VOZ_MIN y tiene pico de
+    habla. El ultimo se sigue hasta techo: el end de un numero viene truncado.
+    """
+    s, e = float(w["start"]), float(w["end"])
+    if db is None or e - s < SILENCIO_EN_WORD:
+        return []
+    voz = [r for r in runs_voz(db, s, e) if r[1] - r[0] >= BLIP_MAX]
+    bordes = [s] + [x for r in voz for x in r] + [e]
+    if max(bordes[k + 1] - bordes[k] for k in range(0, len(bordes) - 1, 2)) < SILENCIO_EN_WORD:
+        return []
+    return [b for b in fusionar_runs(runs_voz(db, s, max(e, techo)))
+            if b[0] < e and b[1] - b[0] >= BLOQUE_VOZ_MIN and db_pico(db, *b) > HABLA_DB]
+
+
 # ---------------------------------------------------------------------------
 # Los checks
 # ---------------------------------------------------------------------------
@@ -458,6 +481,38 @@ def verificar(edl, edit_dir, transcripts, energia):
                                 f"la voz empezo {s - rs:.2f}s antes del corte (pico {pico:.0f} dB): "
                                 "se come el inicio de una palabra - medir con silencios reales", s)
                         break
+
+    # --- Check 10: voz de una word estirada fuera de todo corte (2026-10-28) --
+    # La word se conserva (su cobertura cae en un range), pero tiene una pausa dentro y uno de
+    # sus bloques de voz no entra en ningun corte. Asi se perdio "uno," en el largo del segundo
+    # cerebro: ningun otro check lo vio porque la word "estaba" en el range por su cobertura.
+    for key, ws_k in transcripts.items():
+        db = energia.get(key)
+        spans = [(float(r["start"]), float(r["end"]), i)
+                 for i, r in enumerate(ranges) if r.get("source") == key]
+        if db is None or not spans:
+            continue
+        for k, w in enumerate(ws_k):
+            if float(w["end"]) - float(w["start"]) < SILENCIO_EN_WORD:
+                continue
+            cs, ce = cobertura(w, db)
+            dentro = [sp for sp in spans if sp[0] < ce and sp[1] > cs]
+            if not dentro:
+                continue
+            ant = cobertura(ws_k[k - 1], db) if k > 0 else None
+            sig = cobertura(ws_k[k + 1], db) if k + 1 < len(ws_k) else None
+            techo = sig[0] - 0.02 if sig else float(w["end"]) + 1.0
+            for b0, b1 in bloques_word(w, db, techo):
+                if any(sp[0] < b1 and sp[1] > b0 for sp in spans):
+                    continue
+                if any(v and v[0] < b1 and v[1] > b0 for v in (ant, sig)):
+                    continue  # audio de la word vecina, no de esta
+                r0, r1, i = dentro[-1] if b0 >= ce else dentro[0]
+                add("WARN", "bloque-fuera", i, outs[i] + (r1 - r0 if b0 >= ce else 0.0),
+                    f"'{txt(w)}' declarada {float(w['end']) - float(w['start']):.2f}s sobre una pausa: "
+                    f"su bloque de voz {b0:.2f}-{b1:.2f} ({b1 - b0:.2f}s, pico {db_pico(db, b0, b1):.0f} dB) "
+                    "queda fuera de todo corte - transcribirlo: si es la palabra, agregarlo como "
+                    "corte propio con ~0.1 s de margen", b0)
 
     # --- Check 3: gaps inter-range (Preset 5) ------------------------------
     #
