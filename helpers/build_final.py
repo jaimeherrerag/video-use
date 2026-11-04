@@ -120,9 +120,16 @@ def build_maestro(edit: Path, edl: dict, spec: dict, spec_path: Path, fps: int, 
     if cortes_cambiaron or not pcm.exists():
         print("voz: cortes exactos de la fuente -> voz.wav")
         claves = list(dict.fromkeys(r["source"] for r in edl["ranges"]))
+        # voz procesada (auphonic_voz.py): esa fuente aporta su voz desde la linea de tiempo procesada
+        voz = edl.get("voz")
+        if voz:
+            fuera = [i + 1 for i, r in enumerate(edl["ranges"]) if r["source"] == voz["fuente"]
+                     and not any(a - 1e-3 <= r["start"] and r["end"] <= b + 1e-3 for a, b in voz["islas"])]
+            if fuera:
+                sys.exit(f"cortes {fuera} fuera de la voz procesada: corre auphonic_voz.py (o quita 'voz' del edl.json)")
         entradas = []
         for k in claves:
-            src = Path(edl["sources"][k])
+            src = Path(voz["archivo"] if voz and k == voz["fuente"] else edl["sources"][k])
             entradas += ["-i", src if src.is_absolute() else (edit / src).resolve()]
         fc = []
         rs = edl["ranges"]

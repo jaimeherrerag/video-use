@@ -687,6 +687,13 @@ def extract_all_segments(
         vpath = resolve_path(sources[vkey], edit_dir)
         vstart = start - off
         audio_de = (src_path, start) if separada else None
+        # voz procesada (auphonic_voz.py): sale de su propia linea de tiempo, que es la de la guia
+        voz = edl.get("voz")
+        if voz and src_name == voz["fuente"]:
+            if not any(a - 1e-3 <= start and end <= b + 1e-3 for a, b in voz["islas"]):
+                raise SystemExit(f"corte {i + 1} ({start:.2f}-{end:.2f} s) fuera de la voz procesada: "
+                                 f"corre auphonic_voz.py (o quita 'voz' del edl.json)")
+            audio_de = (Path(voz["archivo"]), start)
         # juntura continua (el corte anterior/siguiente sigue en el mismo audio sin hueco): sin fundido
         prev = ranges[i - 1] if i > 0 else None
         nxt = ranges[i + 1] if i + 1 < len(ranges) else None
