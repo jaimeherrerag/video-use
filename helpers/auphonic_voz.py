@@ -3,14 +3,15 @@
 
 No se sube la grabacion cruda (en el largo del CRM eran 24.8 min para 7 de video): se toman los
 ranges del edl.json con un margen, se juntan en "islas" y solo esas se suben con el preset de
-Auphonic (por defecto "Studio Voice medio"). Lo que vuelve se alinea contra lo subido (quita el
-jingle del plan gratis y el retraso de Studio Voice) y se recoloca en la linea de tiempo de la guia:
+Auphonic ("Studio Voice medio") y los ajustes que lo pisan (por defecto Voice AutoEQ con ruido y eco
+a 6 dB: Jaime oyo Studio Voice demasiado artificial, 2026-11-05). Lo que vuelve se alinea contra lo
+subido (quita el jingle del plan gratis y el retraso del modelo) y se recoloca en la linea de tiempo de la guia:
 <edit>/voz/voz_auphonic.wav. Con "voz" en el edl.json, render.py (largos) y build_final (shorts)
 toman la voz de ahi; si un corte cae fuera de las islas se detienen en vez de mezclar voz cruda.
 
 Correrlo despues de from-studio y antes de build_final:
 
-    auphonic_voz.py --edit-dir E [--preset "Studio Voice medio"] [--margen 1.0] [--dry-run]
+    auphonic_voz.py --edit-dir E [--preset "Studio Voice medio"] [--ajustes "clave=valor,..."] [--margen 1.0] [--dry-run]
 
 Tras un cambio de cortes procesa solo las islas que faltan, con islas vecinas como contexto
 (Auphonic cobra minimo 3 min) para igualar el nivel con lo ya procesado. Quitar "voz" del edl.json
@@ -41,6 +42,10 @@ DESFASE_MAX = 20.0               # jingle + retraso: el inicio de lo subido apar
 DERIVA_MAX_MS = 20               # entre inicio y final; mas que eso no es un desfase fijo
 CORR_MIN = 0.9
 API = "https://auphonic.com/api"
+# Ajustes que pisan al preset en cada produccion (Simple API). Studio Voice (filtermethod=studiovoice)
+# resintetiza la voz y a Jaime le sono artificial en los anuncios del 2026-11-05; de 5 versiones a ciegas
+# del mismo tramo eligio Voice AutoEQ con ruido y eco a 6 dB. "" = el preset tal cual.
+AJUSTES_DEFAULT = "filtermethod=autoeq,denoiseamount=6,deverbamount=6"
 
 
 # --- audio ------------------------------------------------------------------------------------
@@ -147,13 +152,20 @@ def _req():
     return requests, {"Authorization": f"bearer {key}"}
 
 
-def procesar_en_auphonic(entrada: Path, preset: str, titulo: str, salida: Path) -> dict:
+def leer_ajustes(texto: str) -> dict:
+    return dict(kv.strip().split("=", 1) for kv in texto.split(",") if kv.strip())
+
+
+def procesar_en_auphonic(entrada: Path, preset: str, titulo: str, salida: Path, ajustes: dict | None = None) -> dict:
     """Sube, espera y baja el WAV. Devuelve los datos de la produccion."""
     requests, h = _req()
-    print(f"  subiendo {entrada.name} ({entrada.stat().st_size / 1e6:.0f} MB) con el preset '{preset}'", flush=True)
+    ajustes = ajustes or {}
+    print(f"  subiendo {entrada.name} ({entrada.stat().st_size / 1e6:.0f} MB) con el preset '{preset}'"
+          + (f" + {ajustes}" if ajustes else ""), flush=True)
     with open(entrada, "rb") as f:
         r = requests.post(f"{API}/simple/productions.json", headers=h, timeout=1800,
-                          data={"preset": preset, "title": titulo, "action": "start"}, files={"input_file": f})
+                          data={"preset": preset, "title": titulo, "action": "start", **ajustes},
+                          files={"input_file": f})
     r.raise_for_status()
     if not (r.json().get("data") or {}).get("uuid"):
         raise SystemExit(f"Auphonic no creo la produccion: {r.json().get('error_message') or r.text[:300]}")
@@ -172,6 +184,11 @@ def procesar_en_auphonic(entrada: Path, preset: str, titulo: str, salida: Path) 
         if time.time() - t0 > 5400:
             raise SystemExit(f"Auphonic no termino en 90 min; revisar {uuid}")
         time.sleep(10)
+    # que Auphonic haya aplicado los ajustes y no el preset tal cual
+    distintos = {k: (v, d.get("algorithms", {}).get(k)) for k, v in ajustes.items()
+                 if str(d.get("algorithms", {}).get(k)) != str(v)}
+    if distintos:
+        raise SystemExit(f"Auphonic no aplico los ajustes (pedido, aplicado): {distintos}")
     wavs = [o for o in d.get("output_files") or [] if o.get("format") == "wav"]
     if not wavs:
         raise SystemExit(f"el preset '{preset}' no tiene salida WAV 16-bit: agregala en Auphonic")
@@ -189,6 +206,8 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Voz procesada con Auphonic, solo en los tramos del corte")
     ap.add_argument("--edit-dir", type=Path, required=True)
     ap.add_argument("--preset", default="Studio Voice medio")
+    ap.add_argument("--ajustes", default=AJUSTES_DEFAULT,
+                    help=f"clave=valor,... que pisan al preset (default {AJUSTES_DEFAULT}; '' = el preset tal cual)")
     ap.add_argument("--margen", type=float, default=1.0, help="s alrededor de cada corte (contexto para el modelo)")
     ap.add_argument("--fuente", help="clave de la fuente de la voz (por defecto la guia de la grabacion separada)")
     ap.add_argument("--dry-run", action="store_true", help="solo dice que subiria y cuantos minutos cobra")
@@ -206,9 +225,10 @@ def main(argv: list[str] | None = None) -> None:
         fuente = claves[0]
     src = Path(edl["sources"][fuente])
     src = src if src.is_absolute() else (edit / src).resolve()
-    if voz.get("preset") and voz["preset"] != args.preset:
-        raise SystemExit(f"la voz ya procesada usa '{voz['preset']}': mezclar presets dejaria tramos distintos. "
-                         f"Borra 'voz' del edl.json y edit/voz/ para empezar de cero")
+    ajustes = leer_ajustes(args.ajustes)
+    if voz.get("preset") and (voz["preset"], voz.get("ajustes", {})) != (args.preset, ajustes):
+        raise SystemExit(f"la voz ya procesada usa '{voz['preset']}' + {voz.get('ajustes', {})}: mezclar ajustes "
+                         f"dejaria tramos distintos. Borra 'voz' del edl.json y edit/voz/ para empezar de cero")
     if edl.get("audio_filter"):
         print(f"  aviso: el EDL trae audio_filter ({edl['audio_filter']}); se aplicaria encima de la voz procesada")
 
@@ -255,7 +275,8 @@ def main(argv: list[str] | None = None) -> None:
     with tempfile.TemporaryDirectory(dir=dvoz) as tmp:
         ent, sal = Path(tmp) / "islas.flac", Path(tmp) / "auphonic.wav"
         escribir_flac(ent, subida)
-        datos = procesar_en_auphonic(ent, args.preset, f"{edit.parent.name} voz {datetime.now():%Y-%m-%d %H:%M}", sal)
+        datos = procesar_en_auphonic(ent, args.preset, f"{edit.parent.name} voz {datetime.now():%Y-%m-%d %H:%M}", sal,
+                                     ajustes)
         proc = leer_pcm(sal)
 
     # alinear: desfase al inicio y al final de lo subido (jingle + retraso del modelo), lineal entre los dos
@@ -305,7 +326,7 @@ def main(argv: list[str] | None = None) -> None:
     shutil.copy2(edl_p, bk / f"edl_antes-voz_{datetime.now():%Y%m%d-%H%M%S}.json")
     edl = json.loads(edl_p.read_text(encoding="utf-8"))          # por si algo lo cambio mientras Auphonic procesaba
     voz = edl.get("voz") or {}
-    voz.update({"fuente": fuente, "archivo": str(archivo).replace("\\", "/"), "preset": args.preset,
+    voz.update({"fuente": fuente, "archivo": str(archivo).replace("\\", "/"), "preset": args.preset, "ajustes": ajustes,
                 "islas": juntar([tuple(c) for c in cubiertas] + [tuple(x) for x in nuevas])})
     voz.setdefault("producciones", []).append({"uuid": datos.get("uuid"), "fecha": f"{datetime.now():%Y-%m-%d %H:%M}",
                                                "min_subidos": round(seg / 60, 2),
