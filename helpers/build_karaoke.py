@@ -154,6 +154,7 @@ def pills_de_frases(transcript_path: Path, ranges: list[tuple[float, float]], fr
     toks = [w["tok"] for w in words]
     pills, faltan = [], []
     n_link = 0
+    desde = 0   # cada frase se busca despues de la anterior: una frase repetida cae en su lugar, no en la 1a
     for frase in frases:
         # [[...]] marca un wikilink (plantilla de Obsidian): no cuenta para buscar la frase, pero
         # sus words salen con data-wl="<n>" para que la plantilla las agrupe y resalte
@@ -168,10 +169,13 @@ def pills_de_frases(transcript_path: Path, ranges: list[tuple[float, float]], fr
                 links.append(dentro)
             if "]]" in x:
                 dentro = None
-        hit = next((i for i in range(len(toks) - len(ft) + 1) if toks[i:i + len(ft)] == ft), None)
+        ult = len(toks) - len(ft) + 1
+        orden = list(range(min(desde, ult), ult)) + list(range(0, min(desde, ult)))  # si no esta despues, desde el inicio
+        hit = next((i for i in orden if toks[i:i + len(ft)] == ft), None)
         if hit is None:
             faltan.append(frase)
             continue
+        desde = hit + len(ft)
         ws = words[hit:hit + len(ft)]
         for k in range(0, len(ws), max_per_pill):
             trozo = ws[k:k + max_per_pill]
