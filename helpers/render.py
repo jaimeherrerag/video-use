@@ -629,8 +629,12 @@ def fuente_de_vista(edl: dict, r: dict) -> tuple[str, float]:
     f = edl.get("fuentes")
     if not f or not r.get("vista"):
         return r["source"], 0.0
-    k = "camara" if r["vista"] == "camara" else "pantalla"
-    return k, float(f["desfase"].get(k, 0.0))
+    from fuentes_obs import fuente_en  # noqa: E402  (mismo directorio; tramos por pausa o por sesion)
+    v = fuente_en(f, "camara" if r["vista"] == "camara" else "pantalla", float(r["start"]))
+    if v is None:
+        raise SystemExit(f"corte {r['start']:.2f}s: su vista '{r['vista']}' no tiene archivo en ese tramo "
+                         "(quitale la vista para usar la imagen de la guia)")
+    return v
 
 
 def _en_rejilla(t: float, fps: int) -> bool:
@@ -705,8 +709,9 @@ def extract_all_segments(
 
         cam_path, cam_start = vpath, vstart           # de donde sale la camara (para el grade y el pip)
         if separada and r["vista"] != "camara":
-            off_cam = float(edl["fuentes"]["desfase"].get("camara", 0.0))
-            cam_path, cam_start = resolve_path(sources["camara"], edit_dir), start - off_cam
+            from fuentes_obs import fuente_en  # noqa: E402
+            k_cam, off_cam = fuente_en(edl["fuentes"], "camara", start)
+            cam_path, cam_start = resolve_path(sources[k_cam], edit_dir), start - off_cam
         if is_auto:
             seg_filter, _stats = auto_grade_for_clip(cam_path, start=cam_start, duration=duration, verbose=False)
         else:
@@ -736,7 +741,7 @@ def extract_all_segments(
         mono = mono_expr_rango(color, src_name, start, end)
         if mono:
             print(f"        blanco y negro: {mono}")
-        if r.get("sujeto") and not reframe and vkey == ("camara" if separada else src_name):
+        if r.get("sujeto") and not reframe and (r["vista"] == "camara" if separada else vkey == src_name):
             sys.path.insert(0, str(Path(__file__).parent))
             from recorte_color import asset_sujeto  # noqa: E402  (numpy/scipy solo si hace falta)
             sr = r["sujeto"]

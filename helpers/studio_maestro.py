@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from geometria_studio import (W, H, css_de_place, fuente_a_lienzo, lienzo_a_fuente,  # noqa: E402
                               place_de_css, place_de_reframe, rect_div, reframe_de_place)
 from mezcla_studio import clips_audio, leer_audio  # noqa: E402
+from fuentes_obs import fuente_en  # noqa: E402
 from recorte_color import (asset_sujeto, attr_grading, es_mono, css_capas, html_color, html_sujetos,  # noqa: E402
                            js_transiciones, leer_color, leer_sujetos, plan_color, ventana_sujeto)
 from zooms_studio import CSS as CSS_ZOOM, JS as JS_ZOOM, html_zooms, leer_zooms  # noqa: E402
@@ -138,8 +139,10 @@ def vista_imagen(fsep: dict | None, r: dict) -> tuple[str, float]:
     """Grabacion separada: (fuente de la imagen del corte, desfase respecto a la guia). Sin vista, la suya."""
     if not fsep or not r.get("vista"):
         return r["source"], 0.0
-    k = "camara" if r["vista"] == "camara" else "pantalla"
-    return k, float(fsep["desfase"].get(k, 0.0))
+    v = fuente_en(fsep, "camara" if r["vista"] == "camara" else "pantalla", float(r["start"]))
+    if v is None:
+        sys.exit(f"corte {r['start']:.2f}s: su vista '{r['vista']}' no tiene archivo en ese tramo")
+    return v
 
 
 def asset_completo(src: Path, dst: Path) -> None:
@@ -247,27 +250,29 @@ def to_studio(edit: Path, force: bool) -> None:
             # object-position para el mismo recorte (en un 4K, el cuadrado de 2160 corrido a la derecha)
             pip = {**fsep["pip"], **(r.get("pip") or {})}
             dm, rc = pip["d"] * CW / 1920, pip["recorte"]
-            cw_, ch_ = dims["camara"]
+            k_cam, off_cam = fuente_en(fsep, "camara", float(r["start"]))
+            cw_, ch_ = dims[k_cam]
             px = 100 * rc["x"] / max(1, cw_ - rc["w"]) if cw_ > rc["w"] else 50
             py = 100 * rc["y"] / max(1, ch_ - rc["h"]) if ch_ > rc["h"] else 50
             lines.append(
-                f'    <video id="p{i + 1:03d}" src="assets/{proxies["camara"]}" data-pip="{i}" data-source="camara"'
+                f'    <video id="p{i + 1:03d}" src="assets/{proxies[k_cam]}" data-pip="{i}" data-source="{escape(k_cam)}"'
                 f' data-timeline-label="{escape(etiqueta(f"Cámara (círculo) · clip {i + 1}"))}"\n'
                 f'      data-start="{t0:.3f}" data-duration="{d:.3f}"'
-                f' data-media-start="{r["start"] - float(fsep["desfase"].get("camara", 0)):.3f}"'
+                f' data-media-start="{r["start"] - off_cam:.3f}"'
                 f' data-has-audio="false" data-track-index="2"\n'
                 f'      style="left: {pip["cx"] * CW / 1920 - dm / 2:.1f}px; top: {pip["cy"] * CH / 1080 - dm / 2:.1f}px;'
                 f' width: {dm:.1f}px; height: {dm:.1f}px; object-position: {px:.2f}% {py:.2f}%;" muted playsinline></video>')
         if fsep and r.get("arriba"):
             # 50/50 de los shorts: la pantalla en el panel de arriba, cortada igual que el clip y con su
             # encuadre editable (r.arriba es un reframe "place" sobre el archivo de la pantalla)
-            psw, psh = dims["pantalla"]
+            k_pan, off_pan = fuente_en(fsep, "pantalla", float(r["start"]))
+            psw, psh = dims[k_pan]
             pcss = css_de_place(place_de_reframe(r["arriba"], psw, psh, CW, CH), psw, psh)
             lines.append(
-                f'    <video id="a{i + 1:03d}" src="assets/{proxies["pantalla"]}" data-arriba="{i}" data-source="pantalla"'
+                f'    <video id="a{i + 1:03d}" src="assets/{proxies[k_pan]}" data-arriba="{i}" data-source="{escape(k_pan)}"'
                 f' data-timeline-label="{escape(etiqueta(f"Pantalla · clip {i + 1}"))}"\n'
                 f'      data-start="{t0:.3f}" data-duration="{d:.3f}"'
-                f' data-media-start="{r["start"] - float(fsep["desfase"].get("pantalla", 0)):.3f}"'
+                f' data-media-start="{r["start"] - off_pan:.3f}"'
                 f' data-has-audio="false" data-track-index="1" style="{pcss}" muted playsinline></video>')
     # transiciones de color a mitad de clip: copias graduadas encima de la camara (en la grabacion
     # separada, del archivo de la vista y en su tiempo)

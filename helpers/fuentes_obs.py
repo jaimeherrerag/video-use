@@ -83,6 +83,30 @@ def desfase(guia: np.ndarray, otro: np.ndarray, sr: int = 16000, maximo: float =
     return lags[i] / sr, float(cand[i] / (np.sqrt((guia ** 2).sum() * (otro ** 2).sum()) + 1e-9))
 
 
+def duracion(src: Path, stream: str = "a:0") -> float:
+    """Duracion exacta de un stream (por defecto el mic): la del contenedor puede ser la del video."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries",
+                          "stream=duration:format=duration", "-of", "json", str(src)],
+                         capture_output=True, text=True, check=True).stdout
+    d = json.loads(out)
+    s = (d.get("streams") or [{}])[0].get("duration")
+    return float(s if s not in (None, "N/A") else d["format"]["duration"])
+
+
+def fuente_en(fuentes: dict, k: str, t: float) -> tuple[str, float] | None:
+    """(clave de la fuente, desfase) de la `camara` o la `pantalla` en el segundo `t` de la guia. Con varios
+    tramos (pausas que corren el Source Record, o varias sesiones juntas) cada uno trae su archivo y su desfase;
+    None = en ese tramo no hay archivo de ese tipo (la imagen sale de la guia). Sin tramos, el valor unico."""
+    tramos = fuentes.get("tramos")
+    if not tramos:
+        return k, float(fuentes["desfase"].get(k, 0.0))
+    v = tramos[0][k]
+    for tr in tramos:
+        if tr["desde"] <= t + 1e-6:
+            v = tr[k]
+    return (v[0], float(v[1])) if v else None
+
+
 # ── log de OBS: escenas ───────────────────────────────────────────────────────
 
 def _seg(hhmmss: str) -> float:
@@ -103,13 +127,14 @@ def buscar_log(guia: Path) -> Path | None:
     return None
 
 
-def escenas_del_log(log: Path, guia: Path) -> tuple[list[dict], str | None, list[float]]:
+def escenas_del_log(log: Path, guia: Path) -> tuple[list[dict], str | None, list[float], dict[str, float]]:
     """Escenas al aire durante la grabacion de `guia`, en segundos de la guia: [{desde, escena}].
-    Devuelve tambien el nombre de la coleccion de escenas que estaba cargada y el segundo de cada pausa."""
+    Devuelve tambien el nombre de la coleccion de escenas que estaba cargada, el segundo de cada pausa y el
+    segundo de la guia en que Source Record abrio cada uno de sus archivos ({nombre: s})."""
     lineas = log.read_text(encoding="utf-8", errors="replace").splitlines()
     rx_t = re.compile(r"^(\d\d:\d\d:\d\d\.\d+): (.*)$")
     rx_esc = re.compile(r"(?:User s|S)witched to scene '(.*)'")
-    escena, coleccion, t0, eventos, grabando = None, None, None, [], False
+    escena, coleccion, t0, eventos, grabando, inicios = None, None, None, [], False, {}
     previo = None
     # la pausa de OBS no avanza el archivo: se resta, y un cambio en pausa entra donde se pauso
     pausado_desde, en_pausa, pausas = None, 0.0, []
@@ -144,9 +169,14 @@ def escenas_del_log(log: Path, guia: Path) -> tuple[list[dict], str | None, list
         if "Writing" in txt and guia.name in txt:
             grabando, t0 = True, t_inicio
             eventos = [{"desde": 0.0, "escena": escena or "?"}]
+        elif grabando and "Writing" in txt and "'" in txt:
+            # Source Record abre su archivo cuando la fuente sale al aire: si fue despues, aqui queda en que
+            # segundo de la guia empezo (Higgsfield 2026-11-05: la pantalla, con la primera escena de pantalla)
+            inicios[Path(txt.split("'")[-2]).name] = round((pausado_desde if pausado_desde is not None else t)
+                                                           - t0 - en_pausa, 3)
         elif grabando and "==== Recording Stop" in txt:
             break
-    return eventos, coleccion, pausas
+    return eventos, coleccion, pausas, inicios
 
 
 # ── coleccion de escenas: el circulo de la camara ───────────────────────────
@@ -199,22 +229,43 @@ def pip_de_obs(escena_pip: str | None) -> dict:
 
 # ── comandos ──────────────────────────────────────────────────────────────────
 
-def hermano(guia: Path, sufijo: str) -> Path | None:
+def _hora(stem: str) -> datetime | None:
+    m = re.match(r"(\d{4}-\d\d-\d\d \d\d-\d\d-\d\d)", stem)
+    return datetime.strptime(m.group(1), "%Y-%m-%d %H-%M-%S") if m else None
+
+
+def hermano(guia: Path, sufijo: str) -> tuple[Path, float] | None:
+    """El archivo de Source Record de esta guia y los segundos (de reloj) que arranco despues. Source Record
+    puede nombrarlo con un segundo de mas, o arrancar minutos despues si el filtro se activo tarde (Higgsfield,
+    2026-11-05: la pantalla empezo 3.5 min despues): se toma el mas cercano que empiece en los 10 min siguientes."""
     for ext in (".mp4", ".mkv", ".mov"):
         p = guia.with_name(guia.stem + sufijo + ext)
         if p.exists():
-            return p
-    return None
+            return p, 0.0
+    h0 = _hora(guia.stem)
+    if not h0:
+        return None
+    cand = []
+    for p in guia.parent.glob(f"*{sufijo}.*"):
+        h = _hora(p.stem)
+        if h and p.suffix in (".mp4", ".mkv", ".mov") and 0 <= (h - h0).total_seconds() <= 600:
+            cand.append(((h - h0).total_seconds(), p))
+    if not cand:
+        return None
+    s, p = min(cand)
+    return p, s
 
 
 def ingesta(guia: Path, edit: Path) -> None:
     edit.mkdir(parents=True, exist_ok=True)
-    archivos = {"guia": guia}
+    archivos, tarde = {"guia": guia}, {}
     for k, suf in SUFIJOS.items():
-        p = hermano(guia, suf)
-        if not p:
+        h = hermano(guia, suf)
+        if not h:
             sys.exit(f"no encontre '{guia.stem}{suf}.mp4' junto a la guia")
-        archivos[k] = p
+        archivos[k], tarde[k] = h
+        if tarde[k] > 3:
+            print(f"  aviso: {k} arranco ~{tarde[k]:.0f} s despues de la guia: antes de eso no hay imagen de {k}")
     for k, p in archivos.items():
         print(f"  {k:9s} {p.name}  ({p.stat().st_size / 1e9:.2f} GB)")
 
@@ -227,10 +278,17 @@ def ingesta(guia: Path, edit: Path) -> None:
 
     # escenas del log de OBS
     log = buscar_log(guia)
-    escenas, mapa_esc, pausas = [], {}, []
+    escenas, mapa_esc, pausas, del_log = [], {}, [], set()
     if log:
         shutil.copy2(log, edit / "obs_log.txt")
-        escenas, _, pausas = escenas_del_log(log, guia)
+        escenas, _, pausas, inicios = escenas_del_log(log, guia)
+        # un archivo que arranco tarde: el log dice en que segundo de la guia (la hora del nombre es de reloj y
+        # no descuenta las pausas)
+        for k in SUFIJOS:
+            if tarde[k] > 3 and archivos[k].name in inicios:
+                tarde[k] = inicios[archivos[k].name]
+                del_log.add(k)
+                print(f"  {k} empieza en el segundo {tarde[k]:.2f} de la guia (log de OBS)")
         for e in escenas:
             mapa_esc.setdefault(e["escena"], vista_de_escena(e["escena"]))
             e["vista"] = mapa_esc[e["escena"]]
@@ -242,28 +300,55 @@ def ingesta(guia: Path, edit: Path) -> None:
               "(se puede editar fuentes.json o cambiar la vista en Studio)")
         escenas = [{"desde": 0.0, "escena": "?", "vista": "camara"}]
 
-    # desfases por audio. Cada pausa puede correr un cuadro el Source Record respecto a la guia (2026-10-26:
-    # 166.7 -> 133.3 ms tras la 3a de 10), asi que se mide al inicio y despues de cada pausa, y se usa el MENOR:
-    # con el error a ese lado la imagen va adelantada al audio, que es lo que menos se nota (<= ~125 ms).
-    ventanas = [0.0] + [p + 5 for p in pausas]
-    guias = {w: mono16k(guia, 120 if w == 0 else 40, w) for w in ventanas}
-    desf, tramos = {}, {}
+    # desfases por audio, uno por tramo entre pausas. Cada pausa puede correr el Source Record respecto a la guia:
+    # 1 cuadro en el largo del segundo cerebro (2026-10-26), pero hasta 2.4 s en el de Higgsfield (2026-11-06), asi
+    # que un solo valor no sirve: `tramos` guarda el desfase de cada tramo y render/Studio lo leen con fuente_en().
+    # Cada tramo se mide sobre el mismo (no a ciegas desde la pausa) y la busqueda va alrededor del anterior.
+    dur_g = duracion(guia)
+    # bordes: las pausas y el inicio de un archivo que arranco tarde (antes de el, ese tipo queda sin imagen)
+    bordes = sorted({0.0, *[p for p in pausas if 1.0 < p < dur_g - 1.0],
+                     *[tarde[k] for k in del_log if 1.0 < tarde[k] < dur_g - 1.0]}) + [dur_g]
+    desf, por_tipo = {}, {}
     for k in SUFIJOS:
-        medidos = []
-        for w in ventanas:
-            d, c = desfase(guias[w], mono16k(archivos[k], 120 if w == 0 else 40, w))
-            if w == 0 and c < 0.5:
+        base = tarde[k] if tarde[k] > 3 else 0.0
+        prev, medidos, primero = base, [], True
+        for a, b in zip(bordes, bordes[1:]):
+            g0 = max(a + 0.3, prev + 0.5) if base else a + 0.3
+            ancho = 120.0 if primero else 60.0
+            g1 = min(b - 0.3, g0 + ancho)
+            if g1 - g0 < 1.5:
+                medidos.append({"desde": round(a, 3), "s": None if primero and base else prev, "c": None})
+                continue
+            # el primero de un archivo que arranco tarde: la hora del nombre es de reloj y las pausas previas la
+            # corren, asi que se busca en +-30 s
+            maximo = 30.0 if primero and base and k not in del_log else 3.0
+            o0 = max(0.0, g0 - prev)                    # el mismo instante segun el desfase anterior
+            d, c = desfase(mono16k(guia, g1 - g0, g0), mono16k(archivos[k], g1 - g0 + maximo, o0), maximo=maximo)
+            d += g0 - o0
+            if primero and c < 0.5:
                 sys.exit(f"el audio de {archivos[k].name} no se parece al de la guia (correlacion {c:.2f}): "
                          "revisa que el filtro grabe la pista 1 (o All)")
-            if c >= 0.5:
-                medidos.append({"desde": round(w, 2), "s": round(d, 4)})
-        desf[k] = min(m["s"] for m in medidos)
-        valores = sorted({m["s"] for m in medidos})
-        print(f"  desfase {k}: {desf[k] * 1000:+.1f} ms ({desf[k] * FPS:+.1f} cuadros; {len(medidos)} mediciones)")
-        if len(valores) > 1:
-            tramos[k] = medidos
-            print(f"    aviso: cambia tras las pausas ({', '.join(f'{v * 1000:+.1f}' for v in valores)} ms); "
-                  f"error maximo {(valores[-1] - valores[0]) * 1000:.0f} ms con la imagen adelantada")
+            if c < 0.5:
+                print(f"    aviso: {k} {a:.1f}-{b:.1f}s correlacion {c:.2f}: se queda el desfase anterior")
+                d = prev
+            medidos.append({"desde": round(a, 3), "s": round(d, 4), "c": round(c, 2)})
+            prev, primero = d, False
+        # un tramo sin archivo todavia (arranco tarde) queda en None; los cortos heredan el anterior
+        por_tipo[k] = medidos
+        valores = [m["s"] for m in medidos if m["s"] is not None]
+        desf[k] = min(valores)
+        dist = sorted(set(valores))
+        print(f"  desfase {k}: {', '.join(f'{v * 1000:+.1f}' for v in dist)} ms en {len(medidos)} tramos")
+        if base:
+            sin = [m["desde"] for m in medidos if m["s"] is None]
+            print(f"    sin imagen de {k} en los tramos que empiezan en {sin} s (arranco tarde)")
+    # tramos combinados: [{desde, camara: [clave, desfase] | None, pantalla: [...]}], sin repetir iguales
+    tramos = []
+    for j, a in enumerate(bordes[:-1]):
+        t = {"desde": round(a, 3), **{k: ([k, por_tipo[k][j]["s"]] if por_tipo[k][j]["s"] is not None else None)
+                                     for k in SUFIJOS}}
+        if not tramos or any(tramos[-1][k] != t[k] for k in SUFIJOS):
+            tramos.append(t)
 
     escena_pip = next((e for e, v in mapa_esc.items() if v == "pantalla_camara"), None)
     pip = pip_de_obs(escena_pip) if escena_pip else dict(PIP_DEFECTO, de="medido 2026-10-23")
@@ -271,10 +356,73 @@ def ingesta(guia: Path, edit: Path) -> None:
 
     f = {"guia": str(guia).replace("\\", "/"),
          "archivos": {k: str(p).replace("\\", "/") for k, p in archivos.items() if k != "guia"},
-         "desfase": desf, **({"desfase_tramos": tramos} if tramos else {}), "escenas": escenas, "vistas_por_escena": mapa_esc, "pip": pip,
+         "desfase": desf, "tramos": tramos, "medidos": por_tipo, "pausas": pausas, "duracion": dur_g,
+         "escenas": escenas, "vistas_por_escena": mapa_esc, "pip": pip,
          "log": "obs_log.txt" if log else None, "generado": datetime.now().isoformat(timespec="seconds")}
     (edit / "fuentes.json").write_text(json.dumps(f, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  -> {edit / 'fuentes.json'}")
+
+
+def juntar(sesiones: list[Path], edit: Path) -> None:
+    """Varias grabaciones de un mismo video (cada una ya con su `ingesta`) en UNA linea de tiempo: la guia de
+    todas seguidas (guia_juntas.mov, la unica que se recodifica: 720p) y un fuentes.json cuyos tramos apuntan a
+    la camara y la pantalla de cada sesion, que se quedan como estan. Cada sesion entra con un largo exacto en
+    cuadros (el audio se recorta al cuadro; la cola de una grabacion es silencio), asi el audio de la sesion N
+    empieza justo en la suma de las anteriores y los desfases se trasladan sin error."""
+    fs = [json.loads((s / "fuentes.json").read_text(encoding="utf-8")) for s in sesiones]
+    edit.mkdir(parents=True, exist_ok=True)
+    largos = [int(duracion(Path(f["guia"])) * FPS) / FPS for f in fs]
+    inicio = [round(sum(largos[:i]), 4) for i in range(len(fs))]
+
+    dst = edit / "guia_juntas.mov"
+    n = len(fs)
+    ins, fc, cat = [], [], ""
+    for i, (f, d) in enumerate(zip(fs, largos)):
+        ins += ["-i", f["guia"]]
+        fc.append(f"[{i}:v:0]fps={FPS},tpad=stop_mode=clone:stop_duration=2,trim=duration={d:.4f},"
+                  f"setpts=PTS-STARTPTS[v{i}]")
+        for a in (0, 1):
+            fc.append(f"[{i}:a:{a}]aresample=48000,apad,atrim=duration={d:.4f},asetpts=PTS-STARTPTS[a{i}_{a}]")
+        cat += f"[v{i}][a{i}_0][a{i}_1]"
+    fc.append(f"{cat}concat=n={n}:v=1:a=2[v][a0][a1]")
+    if not dst.exists():
+        print(f"  {dst.name}: {n} sesiones, {sum(largos) / 60:.1f} min (recodifica la guia de 720p)", flush=True)
+        tmp = dst.with_suffix(".tmp.mov")
+        subprocess.run(["ffmpeg", "-v", "error", "-stats", "-y", *ins, "-filter_complex", ";".join(fc),
+                        "-map", "[v]", "-map", "[a0]", "-map", "[a1]", "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", str(tmp)], check=True)
+        tmp.replace(dst)
+    real = duracion(dst)
+    if abs(real - sum(largos)) > 0.01:
+        sys.exit(f"{dst.name} dura {real:.3f} s y deberia durar {sum(largos):.3f} s")
+    wav = edit / "mic16k.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(dst), "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+                    "-c:a", "pcm_s16le", str(wav)], check=True)
+
+    archivos, tramos, escenas, mapa, pausas, sesion = {}, [], [], {}, [], []
+    for i, (f, g0, d) in enumerate(zip(fs, inicio, largos), start=1):
+        for k, p in f["archivos"].items():
+            archivos[f"{k}_s{i}"] = p
+        for tr in f["tramos"]:
+            if tr["desde"] < d:
+                tramos.append({"desde": round(g0 + tr["desde"], 4),
+                               **{k: ([f"{v[0]}_s{i}", round(g0 + v[1], 4)] if v else None)
+                                  for k, v in tr.items() if k != "desde"}})
+        for e in f["escenas"]:
+            if e["desde"] < d:
+                escenas.append(dict(e, desde=round(g0 + e["desde"], 3)))
+        mapa.update(f["vistas_por_escena"])
+        pausas += [round(g0 + p, 3) for p in f.get("pausas", []) if p < d]
+        sesion.append({"n": i, "desde": g0, "hasta": round(g0 + d, 4), "guia": f["guia"],
+                       "edit": str(sesiones[i - 1]).replace("\\", "/")})
+        print(f"  sesion {i}: {g0:8.2f} - {g0 + d:8.2f} s  ({Path(f['guia']).name})")
+    out = {"guia": str(dst).replace("\\", "/"), "archivos": archivos,
+           "desfase": {k: tramos[0][k][1] for k in SUFIJOS if tramos[0].get(k)}, "tramos": tramos,
+           "pausas": pausas, "duracion": round(sum(largos), 4), "sesiones": sesion, "escenas": escenas,
+           "vistas_por_escena": mapa, "pip": fs[0]["pip"], "generado": datetime.now().isoformat(timespec="seconds")}
+    (edit / "fuentes.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"  {len(tramos)} tramos, {len(escenas)} escenas -> {edit / 'fuentes.json'}")
+    print(f"  (transcribir mic16k.wav con -o transcripts/guia.json y build_cleanup_edl sobre {dst.name} --key guia)")
 
 
 def vista_en(escenas: list[dict], t: float) -> str:
@@ -295,7 +443,8 @@ def vistas(edit: Path) -> None:
     kg = claves[0]
     # las vistas pueden haberse corregido a mano en vistas_por_escena
     escenas = [dict(e, vista=f["vistas_por_escena"].get(e["escena"], e.get("vista", "camara"))) for e in f["escenas"]]
-    cambios = [e["desde"] for e in escenas[1:]]
+    # tambien se parte donde cambia el archivo o el desfase (pausas que corren el Source Record, otra sesion)
+    cambios = sorted({e["desde"] for e in escenas[1:]} | {t["desde"] for t in (f.get("tramos") or [])[1:]})
 
     nuevos, n_part = [], 0
     for r in edl["ranges"]:
@@ -328,11 +477,27 @@ def vistas(edit: Path) -> None:
                 p["continuo"] = r["continuo"]
             nuevos.append(p)
 
+    # un tramo sin el archivo que pide su vista (la pantalla arranco tarde): la imagen sale de la guia (720p)
+    sin_archivo = 0
+    if f.get("tramos"):
+        for p in nuevos:
+            if p.get("source") != kg or not p.get("vista"):
+                continue
+            t = p["start"] + 0.01
+            if p["vista"] != "camara" and fuente_en(f, "pantalla", t) is None:
+                del p["vista"]
+                sin_archivo += 1
+            elif p["vista"] == "pantalla_camara" and fuente_en(f, "camara", t) is None:
+                p["vista"] = "pantalla"
+    if sin_archivo:
+        print(f"  {sin_archivo} cortes sin archivo de pantalla en su tramo: van con la imagen de la guia")
+
     bk = edit / "edl_backups"
     bk.mkdir(exist_ok=True)
     shutil.copy2(edl_p, bk / f"edl_antes-vistas_{datetime.now():%Y%m%d-%H%M%S}.json")
     edl["sources"].update(f["archivos"])
-    edl["fuentes"] = {"guia": kg, "desfase": f["desfase"], "pip": f["pip"]}
+    edl["fuentes"] = {"guia": kg, "desfase": f["desfase"], "pip": f["pip"],
+                      **({"tramos": f["tramos"]} if f.get("tramos") else {})}
     edl["ranges"] = nuevos
     edl_p.write_text(json.dumps(edl, ensure_ascii=False, indent=2), encoding="utf-8")
     cuenta = {}
@@ -426,8 +591,9 @@ def cincuenta(edit: Path, pantalla_xy: tuple[int, int] | None) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["ingesta", "vistas", "tramo", "cincuenta"])
+    ap.add_argument("cmd", choices=["ingesta", "juntar", "vistas", "tramo", "cincuenta"])
     ap.add_argument("--guia", type=Path, help="ingesta: el archivo principal de OBS (la guia de 720p)")
+    ap.add_argument("--sesiones", type=Path, nargs="+", help="juntar: los edit de cada ingesta, en orden")
     ap.add_argument("--edit-dir", required=True, type=Path)
     ap.add_argument("--origen", type=Path, help="tramo: el edit del largo (con su fuentes.json)")
     ap.add_argument("--desde", type=float, help="tramo: segundo de la guia donde empieza")
@@ -440,6 +606,10 @@ def main() -> int:
         if not a.guia:
             ap.error("ingesta necesita --guia")
         ingesta(a.guia.resolve(), edit)
+    elif a.cmd == "juntar":
+        if not a.sesiones:
+            ap.error("juntar necesita --sesiones")
+        juntar([s.resolve() for s in a.sesiones], edit)
     elif a.cmd == "vistas":
         vistas(edit)
     elif a.cmd == "tramo":
