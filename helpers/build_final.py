@@ -305,15 +305,18 @@ def main() -> int:
                  "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", base])
             (sdir / ".base.sha1").write_text((tr["pcm"].parent / ".edl.sha1").read_text())
             frases = sdir / "frases.txt"
-            if frases.exists():
-                print(f"slot {tr['nombre']}: karaoke de frases clave")
+            # karaoke "completo" (studio.slots[i].karaoke): subtitulos de todo lo que se dice en el tramo, sin
+            # frases.txt (largo de Higgsfield, 2026-11-12: solo en los tramos de camara)
+            completo = tr["slot"].get("karaoke") == "completo"
+            if frases.exists() or completo:
+                print(f"slot {tr['nombre']}: karaoke " + ("completo" if completo else "de frases clave"))
                 key = next(iter(edl["sources"]))
                 run(PY + [HELP / "build_karaoke.py", "--transcript", edit / "transcripts" / f"{key}.json",
                           "--edl", tr["pcm"].parent / "edl.json",
                           "--template", REPO / (tr["slot"].get("karaoke_template")
                                                 or "presets/glass-composition/compositions/subtitles.html"),
-                          "--output", sdir / "compositions" / "subtitles.html", "--frases", frases,
-                          "--max-per-pill", "9"])
+                          "--output", sdir / "compositions" / "subtitles.html",
+                          *(["--max-per-pill", "7"] if completo else ["--frases", frases, "--max-per-pill", "9"])])
         # duraciones del slot = las del video base (root, video, audio, karaoke, padding)
         D = dur_video(base)
         idx = sdir / "index.html"
