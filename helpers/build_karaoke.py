@@ -50,8 +50,13 @@ def group_into_pills(
     silence_break: float = 0.45,
     max_per_pill: int = 7,
     min_per_pill: int = 2,
+    max_chars: int = 0,
 ) -> list[dict]:
-    """Group words into pill phrases. Returns list of pills, each with words list."""
+    """Group words into pill phrases. Returns list of pills, each with words list.
+
+    `max_chars` (0 = sin tope): una pill que pasaria de ese largo en caracteres se parte antes.
+    Con solo `max_per_pill`, siete palabras largas no cabian en una linea y la pill se doblaba en
+    dos renglones encimados (largo de Higgsfield, 2026-11-12: 10 pills de 48-53 caracteres)."""
     if not words:
         return []
 
@@ -66,6 +71,7 @@ def group_into_pills(
         if current and (
             gap >= silence_break
             or len(current) >= max_per_pill
+            or (max_chars and len(" ".join(x["text"] for x in current + [w])) > max_chars)
         ):
             # only flush if min_per_pill satisfied
             if len(current) >= min_per_pill:
@@ -233,6 +239,7 @@ def collect_pills_from_ranges(
     ranges: list[tuple[float, float]],
     silence_break: float,
     max_per_pill: int,
+    max_chars: int = 0,
 ) -> tuple[list[dict], float]:
     """Iterate multi-segment ranges and accumulate output-time pills.
 
@@ -242,17 +249,21 @@ def collect_pills_from_ranges(
     all_pills: list[dict] = []
     out_offset = 0.0
     pill_idx = 0
+    vistas = set()   # una word que cruza la juntura de dos cortes se cuenta solo en el primero
 
     for seg_start, seg_end, *propio in ranges:
         seg_duration = seg_end - seg_start
         if propio and not propio[0]:
             out_offset += seg_duration
             continue
-        words = load_words_in_range(transcript_path, seg_start, seg_end)
+        words = [w for w in load_words_in_range(transcript_path, seg_start, seg_end)
+                 if (w["start"], w["end"], w["text"]) not in vistas]
+        vistas.update((w["start"], w["end"], w["text"]) for w in words)
         seg_pills = group_into_pills(
             words, seg_start, seg_duration,
             silence_break=silence_break,
             max_per_pill=max_per_pill,
+            max_chars=max_chars,
         )
         # Shift this segment's times by out_offset (group_into_pills produced
         # times relative to seg_start; add the accumulated offset).
@@ -282,6 +293,8 @@ def main() -> None:
     ap.add_argument("--output", required=True, type=Path)
     ap.add_argument("--silence-break", type=float, default=0.45)
     ap.add_argument("--max-per-pill", type=int, default=7)
+    ap.add_argument("--max-chars", type=int, default=0,
+                    help="largo maximo de una pill en caracteres (0 = sin tope); evita que se doble en dos renglones")
     ap.add_argument("--frases", type=Path,
                     help="archivo con una frase clave por linea: solo esas frases llevan "
                          "subtitulo (el resto del tramo queda sin pill)")
@@ -309,6 +322,7 @@ def main() -> None:
             args.transcript, ranges,
             silence_break=args.silence_break,
             max_per_pill=args.max_per_pill,
+            max_chars=args.max_chars,
         )
     if not pills:
         raise SystemExit("no words found in the given range(s)")

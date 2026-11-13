@@ -316,7 +316,7 @@ def main() -> int:
                           "--template", REPO / (tr["slot"].get("karaoke_template")
                                                 or "presets/glass-composition/compositions/subtitles.html"),
                           "--output", sdir / "compositions" / "subtitles.html",
-                          *(["--max-per-pill", "7"] if completo else ["--frases", frases, "--max-per-pill", "9"])])
+                          *(["--max-per-pill", "7", "--max-chars", "40"] if completo else ["--frases", frases, "--max-per-pill", "9"])])
         # duraciones del slot = las del video base (root, video, audio, karaoke, padding)
         D = dur_video(base)
         idx = sdir / "index.html"
