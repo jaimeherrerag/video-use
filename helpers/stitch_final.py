@@ -85,7 +85,8 @@ def pico_s(path: Path) -> float:
 
 
 def cargar_partes(spec: dict, base: Path, verbose: bool = False) -> list[tuple[Path, Path, float]]:
-    """(video, audio base, duracion). La duracion es la del VIDEO del base PCM."""
+    """(video, audio base, duracion). La duracion es la del VIDEO del base PCM, en cuadros enteros."""
+    fps = int(spec.get("fps", 30))
     parts = []
     for p in spec["parts"]:
         v, a = (base / p["video"]).resolve(), (base / p["audio"]).resolve()
@@ -94,6 +95,10 @@ def cargar_partes(spec: dict, base: Path, verbose: bool = False) -> list[tuple[P
         dv = dur(v, "v:0") if v.suffix.lower() not in (".wav", ".flac") else d   # parte provisional (solo medir)
         if dv + 0.02 < d:
             sys.exit(f"{v.name} dura {dv:.3f}s y su base {d:.3f}s: el video quedaria corto")
+        # duracion en cuadros enteros: el video de cada parte sale con N cuadros y el audio se corta a N/fps.
+        # Con el audio a la duracion exacta y el video redondeado por el filtro fps, cada union atrasaba la
+        # imagen hasta un cuadro: -0.27 s al final del largo de Higgsfield (2026-11-13, Jaime lo vio en el min 11)
+        d = round(d * fps) / fps
         parts.append((v, a, d))
         if verbose:
             print(f"  parte {v.name}: {d:.3f}s (video fuente {dv:.3f}s)")
@@ -107,7 +112,7 @@ def cadena_voz(parts, speed: float) -> tuple[list[str], list[str], int]:
         inputs += ["-i", str(a)]
         # apad: si el audio de una parte quedara corto, el concat lo pegaria antes de tiempo y la voz de
         # todas las partes siguientes iria adelantada a la imagen
-        fc.append(f"[{k}:a:0]apad,atrim=0:{d:.3f},asetpts=PTS-STARTPTS,aresample=48000[p{k}]")
+        fc.append(f"[{k}:a:0]apad,atrim=0:{d:.6f},asetpts=PTS-STARTPTS,aresample=48000[p{k}]")
     n = len(parts)
     fc.append("".join(f"[p{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1"
               + (f",atempo={speed:g}" if abs(speed - 1) > 1e-6 else "") + "[voz]")
@@ -222,7 +227,9 @@ def main() -> int:
     inputs, fc = [], []
     for i, (v, _, d) in enumerate(parts):
         inputs += ["-i", str(v)]
-        fc.append(f"[{i}:v:0]trim=0:{d:.3f},setpts=PTS-STARTPTS,fps={fps},scale={ow}:{oh}:flags=lanczos,"
+        # exactamente round(d*fps) cuadros (tpad por si el video viniera un cuadro corto), igual que su audio
+        fc.append(f"[{i}:v:0]setpts=PTS-STARTPTS,fps={fps},tpad=stop_mode=clone:stop=2,"
+                  f"trim=end_frame={round(d * fps)},setpts=PTS-STARTPTS,scale={ow}:{oh}:flags=lanczos,"
                   f"setsar=1,format=yuv420p[v{i}]")
     vs = "".join(f"[v{i}]" for i in range(len(parts)))
     fc.append(f"{vs}concat=n={len(parts)}:v=1:a=0"

@@ -90,6 +90,15 @@ def group_into_pills(
     if current:
         pills.append(current)
 
+    # Una palabra sola que quedo pegada a la pill anterior (el tope de caracteres o de palabras partio la
+    # frase justo antes de su ultima palabra) se lleva la ultima palabra de la anterior: "agencia de" +
+    # "marketing." (0.3 s en pantalla) -> "agencia" + "de marketing." (largo de Higgsfield, 2026-11-13)
+    for i in range(1, len(pills)):
+        prev, cur = pills[i - 1], pills[i]
+        if len(cur) == 1 and len(prev) >= 3 and cur[0]["start"] - prev[-1]["end"] < silence_break \
+                and prev[-1]["text"][-1:] not in PUNCT_BREAK:
+            cur.insert(0, prev.pop())
+
     # Convert to output-time pills
     out_pills = []
     for i, pwords in enumerate(pills, start=1):
