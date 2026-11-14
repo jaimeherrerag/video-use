@@ -19,6 +19,10 @@ de ahi sale la VISTA de cada corte, o sea de que archivo sale la imagen:
                                     de la coleccion de escenas -> E/fuentes.json (+ copia del log)
     vistas  --edit-dir E            despues de build_cleanup_edl: agrega las fuentes al edl.json, parte los
                                     cortes donde cambio la escena y le pone su vista a cada uno
+    piezas  --origen L --piezas P --edit-dir E
+                                    SHORT DESDE UN LARGO (estandar): pega los pedazos de P (segundos de la guia
+                                    del largo L) en guia/camara/pantalla con el mismo reloj, trae los cortes
+                                    aprobados del largo y los encuadra en 50/50 o camara completa segun la escena
 
 Los cortes siguen en el tiempo de la guia (source = la guia). render.py y studio_maestro.py toman la imagen
 del archivo de su vista en t - desfase, y el audio siempre de la guia.
@@ -553,6 +557,137 @@ def tramo(origen: Path, desde: float, hasta: float, edit: Path, ancho_cam: int) 
           f"{salidas['guia'].name})")
 
 
+def _frame_gris(src: str, t: float) -> np.ndarray:
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", src, "-frames:v", "1",
+                          "-vf", "scale=160:90,format=gray", "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, np.uint8).astype(np.float32)
+
+
+def piezas(origen: Path, spec: Path, edit: Path) -> None:
+    """Short desde VARIOS pedazos de un largo con grabacion separada (la forma estandar desde 2026-11-13).
+    spec = JSON con [{"nombre", "desde", "hasta", "cara_x"?, "pantalla_zona"?: [x, y, ancho]}] en segundos de la guia del largo,
+    en el orden del short. Arma tres fuentes con el MISMO reloj (desfase 0), pegando los pedazos:
+      fuente_guia.mov      la guia (720p + mic PCM): transcript, cortes y auditores
+      fuente_camara.mov    la camara de cada pedazo, entera y en su 4K nativo (margen para reencuadrar), con el mic
+      fuente_pantalla.mov  la pantalla de cada pedazo a 1920x1080 nativa (o la guia si ese tramo no la tiene)
+    y escribe el edl.json con los cortes APROBADOS del largo que caen en cada pedazo, ya encuadrados segun la
+    escena de OBS: "webcam full" -> camara a cuadro completo; escenas con pantalla -> 50/50 (camara abajo,
+    pantalla arriba a 1:1, todo editable en Studio). Tambien transcripts/guia.json y mic16k.wav."""
+    edl_o = json.loads((origen / "edl.json").read_text(encoding="utf-8"))
+    fo = json.loads((origen / "fuentes.json").read_text(encoding="utf-8"))
+    fsep, src_o, kg = edl_o["fuentes"], edl_o["sources"], edl_o["fuentes"]["guia"]
+    escenas = [dict(e, vista=fo["vistas_por_escena"].get(e["escena"], e.get("vista", "camara"))) for e in fo["escenas"]]
+    words = json.loads((origen / "transcripts" / f"{kg}.json").read_text(encoding="utf-8"))["words"]
+    lista = json.loads(spec.read_text(encoding="utf-8"))
+    edit.mkdir(parents=True, exist_ok=True)
+    tmp = edit / "piezas_tmp"
+    tmp.mkdir(exist_ok=True)
+    venc = ["-r", str(FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p",
+            "-g", "6", "-keyint_min", "6", "-sc_threshold", "0"]
+    aenc = ["-c:a", "pcm_s16le", "-ar", "48000"]
+    rec, cw0 = fo["pip"]["recorte"], 3840
+    CW, CH = 3840, 2160                         # camara nativa: el circulo de un programa no aguanta otra reduccion
+    segs = {"guia": [], "camara": [], "pantalla": []}
+    out_w, ranges, mapa, off, avisos = [], [], {}, 0.0, []
+    for p in lista:
+        a = round(round(p["desde"] * FPS) / FPS, 4)
+        b = round(round(p["hasta"] * FPS) / FPS, 4)
+        dur, nom, mid = round(b - a, 4), p["nombre"], (a + b) / 2
+        guia = src_o[kg]
+        cam = fuente_en(fsep, "camara", mid)
+        pan = fuente_en(fsep, "pantalla", mid)
+        for k, (src, t0, vf) in {
+            "guia": (guia, a, None),
+            "camara": (src_o[cam[0]], a - cam[1], f"scale={CW}:{CH}") if cam else (guia, a, f"scale={CW}:{CH}:flags=lanczos"),
+            "pantalla": (src_o[pan[0]], a - pan[1], "scale=1920:1080") if pan else (guia, a, "scale=1920:1080:flags=lanczos"),
+        }.items():
+            dst = tmp / f"{nom}_{k}.mov"
+            if not dst.exists():
+                # el audio siempre de la guia (el mic): asi la camara suena en Studio igual que la guia
+                cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{t0:.4f}", "-i", src, "-ss", f"{a:.4f}", "-i", guia,
+                       "-t", f"{dur:.4f}", "-map", "0:v:0", "-map", "1:a:0", *(["-map", "1:a:1?"] if k == "guia" else []),
+                       *(["-vf", vf] if vf else []), *venc, *aenc, str(dst)]
+                subprocess.run(cmd, check=True)
+            segs[k].append(dst)
+        # escena de OBS a mitad del pedazo y, si es de pantalla, si el archivo "camara" es en realidad el
+        # programa (Source Record puesto sobre la escena: sesiones 1-2 de Higgsfield): ahi la camara sola no
+        # existe y abajo solo cabe el circulo, a baja resolucion
+        vista = vista_en(escenas, mid)
+        programa = False
+        if cam and vista != "camara":
+            dif = np.abs(_frame_gris(src_o[cam[0]], mid - cam[1]) - _frame_gris(guia, mid)).mean()
+            programa = bool(dif < 14)
+            print(f"  {nom}: escena {vista}, diferencia camara-guia {dif:.1f} -> {'programa' if programa else 'camara sola'}")
+        cara_x = p.get("cara_x", (rec["x"] + rec["w"] / 2) * CW / cw0)
+        if vista == "camara":
+            w = round(CH * 9 / 16)
+            enc = {"src_crop": {"x": int(min(max(0, cara_x - w / 2), CW - w)), "y": 0, "w": w, "h": CH},
+                   "dst": {"x": 0, "y": 0, "w": 1080, "h": 1920}, "out_size": {"w": 1080, "h": 1920}, "fit": "place"}
+            arriba = None
+        else:
+            if programa:
+                k = CW / 1920
+                cx, cy, d = fo["pip"]["cx"] * k, fo["pip"]["cy"] * k, fo["pip"]["d"] * k
+                h = int(d * 0.66)                   # rectangulo 9:8 inscrito en el circulo (0.664 d): sin sus orillas
+                w = int(h * 1080 / 960)
+                crop = {"x": int(cx - w / 2), "y": int(cy - h / 2), "w": w, "h": h}
+                avisos.append(f"{nom}: la 'camara' de ese tramo es el programa de OBS; abajo va el circulo ampliado "
+                              f"{1080 / w:.1f}x (se ve suave)")
+            else:
+                w = round(CH * 1080 / 960)
+                crop = {"x": int(min(max(0, cara_x - w / 2), CW - w)), "y": 0, "w": w, "h": CH}
+            enc = {"src_crop": crop, "dst": {"x": 0, "y": 960, "w": 1080, "h": 960},
+                   "out_size": {"w": 1080, "h": 1920}, "fit": "place"}
+            # zona de la pantalla: [x, y, ancho] en px de la pantalla 1080p (alto 9:8). 1080 de ancho = 1:1; menos
+            # ancho agranda el texto (en un celular el texto de una pantalla 1080p a 1:1 casi no se lee)
+            px, py, pw_ = p.get("pantalla_zona", (420, 60, 1080))
+            arriba = {"src_crop": {"x": px, "y": py, "w": pw_, "h": round(pw_ * 960 / 1080)},
+                      "dst": {"x": 0, "y": 0, "w": 1080, "h": 960},
+                      "out_size": {"w": 1080, "h": 1920}, "fit": "place"}
+        mapa[nom] = {"guia_a": a, "guia_b": b, "offset": round(off, 4), "escena": vista, "programa": programa}
+        for w_ in words:
+            if a <= w_["start"] and w_["end"] <= b:
+                out_w.append(dict(w_, start=round(w_["start"] - a + off, 3), end=round(w_["end"] - a + off, 3)))
+        for r in edl_o["ranges"]:
+            if r["source"] != kg or r["end"] <= a or r["start"] >= b:
+                continue
+            s, e = max(r["start"], a), min(r["end"], b)
+            n = {"source": "guia", "start": round(s - a + off, 3), "end": round(e - a + off, 3),
+                 "beat": r.get("beat", ""), "pieza": nom, "vista": "camara", "reframe": enc}
+            if arriba:
+                n["arriba"] = arriba
+            if r.get("censor"):
+                avisos.append(f"{nom}: el corte {r['start']:.2f}s del largo llevaba blur; revisar la pantalla de arriba")
+            ranges.append(n)
+        off += dur
+    for k, files in segs.items():
+        lst = tmp / f"lista_{k}.txt"
+        lst.write_text("".join(f"file '{f.as_posix()}'\n" for f in files), encoding="utf-8")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-map", "0",
+                        "-c", "copy", str(edit / f"fuente_{k}.mov")], check=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(edit / "fuente_guia.mov"), "-map", "0:a:0", "-ac", "1",
+                    "-ar", "16000", "-c:a", "pcm_s16le", str(edit / "mic16k.wav")], check=True)
+    (edit / "transcripts").mkdir(exist_ok=True)
+    (edit / "transcripts" / "guia.json").write_text(json.dumps(
+        {"language_code": "es", "text": " ".join(w["text"] for w in out_w if w.get("type", "word") == "word"),
+         "words": out_w}, ensure_ascii=False, indent=1), encoding="utf-8")
+    edl = {"sources": {k: str(edit / f"fuente_{k}.mov").replace("\\", "/") for k in segs},
+           "fuentes": {"guia": "guia", "desfase": {"camara": 0.0, "pantalla": 0.0}, "pip": fo["pip"]},
+           "ranges": ranges, "studio": {"canvas": {"w": 1080, "h": 1920}, "proxy": False, "render": "maestro"},
+           "origen": {"largo": str(origen).replace("\\", "/"), "piezas": mapa}}
+    edl_p = edit / "edl.json"
+    if edl_p.exists():
+        bk = edit / "edl_backups"
+        bk.mkdir(exist_ok=True)
+        shutil.copy2(edl_p, bk / f"edl_antes-piezas_{datetime.now():%Y%m%d-%H%M%S}.json")
+    edl_p.write_text(json.dumps(edl, ensure_ascii=False, indent=2), encoding="utf-8")
+    tot = sum(r["end"] - r["start"] for r in ranges)
+    print(f"  {len(lista)} pedazos ({off:.1f} s) · {len(ranges)} cortes aprobados del largo · {tot:.1f} s "
+          f"({tot / 1.15:.1f} s a 1.15x)")
+    for v in avisos:
+        print(f"  OJO {v}")
+
+
 def probe_ancho(src: str) -> int:
     return int(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width",
                                "-of", "csv=p=0", src], capture_output=True, text=True, check=True).stdout.strip())
@@ -591,7 +726,7 @@ def cincuenta(edit: Path, pantalla_xy: tuple[int, int] | None) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["ingesta", "juntar", "vistas", "tramo", "cincuenta"])
+    ap.add_argument("cmd", choices=["ingesta", "juntar", "vistas", "tramo", "cincuenta", "piezas"])
     ap.add_argument("--guia", type=Path, help="ingesta: el archivo principal de OBS (la guia de 720p)")
     ap.add_argument("--sesiones", type=Path, nargs="+", help="juntar: los edit de cada ingesta, en orden")
     ap.add_argument("--edit-dir", required=True, type=Path)
@@ -600,6 +735,7 @@ def main() -> int:
     ap.add_argument("--hasta", type=float, help="tramo: segundo de la guia donde termina")
     ap.add_argument("--ancho-camara", type=int, default=2560, help="tramo: ancho de la camara del pedazo")
     ap.add_argument("--pantalla", help="cincuenta: x,y de la zona de 1080x960 de la pantalla (default centrada)")
+    ap.add_argument("--piezas", type=Path, help="piezas: JSON con los pedazos del largo, en el orden del short")
     a = ap.parse_args()
     edit = a.edit_dir.resolve()
     if a.cmd == "ingesta":
@@ -612,6 +748,10 @@ def main() -> int:
         juntar([s.resolve() for s in a.sesiones], edit)
     elif a.cmd == "vistas":
         vistas(edit)
+    elif a.cmd == "piezas":
+        if not (a.origen and a.piezas):
+            ap.error("piezas necesita --origen y --piezas")
+        piezas(a.origen.resolve(), a.piezas.resolve(), edit)
     elif a.cmd == "tramo":
         if not (a.origen and a.desde is not None and a.hasta is not None):
             ap.error("tramo necesita --origen, --desde y --hasta")
