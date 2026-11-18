@@ -26,6 +26,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -211,6 +212,15 @@ def main() -> int:
                        f"- antes: {t_old}", f"- ahora: {t_new}", ""]
         if usar_nuevas:
             dentro.update(id(w) for w in old)
+            # una word vieja estirada hacia afuera (su punto medio cae fuera) que la ventana re-transcribio queda
+            # duplicada: "API." 560.83-569.00 junto a la nueva 560.83-561.07 (largo de IA sin censura, 2026-11-18)
+            norm = lambda s: re.sub(r"[^\w]", "", s.lower())
+            for w in words:
+                if id(w) in dentro or not (float(w["start"]) < v["b"] and float(w["end"]) > v["a"]):
+                    continue
+                if any(norm(n["word"]) == norm(V.txt(w)) and (abs(float(n["start"]) - float(w["start"])) < 0.3
+                       or abs(float(n["end"]) - float(w["end"])) < 0.3) for n in v["nuevas"]):
+                    dentro.add(id(w))
             final += v["nuevas"]
     final += [a_whisperx(w) for w in words if id(w) not in dentro]
     final.sort(key=lambda w: float(w["start"]))
