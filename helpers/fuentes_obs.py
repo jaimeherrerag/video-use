@@ -321,13 +321,21 @@ def ingesta(guia: Path, edit: Path) -> None:
             ancho = 120.0 if primero else 60.0
             g1 = min(b - 0.3, g0 + ancho)
             if g1 - g0 < 1.5:
-                medidos.append({"desde": round(a, 3), "s": None if primero and base else prev, "c": None})
+                # antes de la primera medicion no hay desfase que heredar: se llena al final como un tramo mudo
+                medidos.append({"desde": round(a, 3), "s": None if primero else prev, "c": None,
+                                **({"mudo": True} if primero and not base else {})})
                 continue
             # el primero de un archivo que arranco tarde: la hora del nombre es de reloj y las pausas previas la
             # corren, asi que se busca en +-30 s
             maximo = 30.0 if primero and base and k not in del_log else 3.0
             o0 = max(0.0, g0 - prev)                    # el mismo instante segun el desfase anterior
-            d, c = desfase(mono16k(guia, g1 - g0, g0), mono16k(archivos[k], g1 - g0 + maximo, o0), maximo=maximo)
+            ga = mono16k(guia, g1 - g0, g0)
+            # un tramo mudo no se puede medir (correlacion ~0): hereda del tramo medido mas cercano. Paso en la s1 del
+            # largo de IA sin censura (2026-11-18): una pausa a los 2.5 s dejo un primer tramo de silencio digital
+            if 20 * np.log10(np.sqrt((ga ** 2).mean()) + 1e-9) < -60:
+                medidos.append({"desde": round(a, 3), "s": None, "c": None, "mudo": True})
+                continue
+            d, c = desfase(ga, mono16k(archivos[k], g1 - g0 + maximo, o0), maximo=maximo)
             d += g0 - o0
             if primero and c < 0.5:
                 sys.exit(f"el audio de {archivos[k].name} no se parece al de la guia (correlacion {c:.2f}): "
@@ -337,7 +345,13 @@ def ingesta(guia: Path, edit: Path) -> None:
                 d = prev
             medidos.append({"desde": round(a, 3), "s": round(d, 4), "c": round(c, 2)})
             prev, primero = d, False
-        # un tramo sin archivo todavia (arranco tarde) queda en None; los cortos heredan el anterior
+        # un tramo sin archivo todavia (arranco tarde) queda en None; los cortos heredan el anterior y los mudos el
+        # medido mas cercano (el siguiente; si no hay, el anterior)
+        for i, m in enumerate(medidos):
+            if m.pop("mudo", False) and m["desde"] >= base - 1e-6:
+                sig = [x["s"] for x in medidos[i + 1:] if x["c"] is not None]
+                ant = [x["s"] for x in medidos[:i] if x["s"] is not None]
+                m["s"] = sig[0] if sig else (ant[-1] if ant else None)
         por_tipo[k] = medidos
         valores = [m["s"] for m in medidos if m["s"] is not None]
         desf[k] = min(valores)
