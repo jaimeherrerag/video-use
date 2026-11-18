@@ -53,7 +53,9 @@ BLOQUE_VOZ_MIN = 0.15    # bloque de voz dentro de una word estirada: mas corto 
 # "borra eso" rapido, pero tambien es una locucion legitima -> severidad INFO.
 RE_MARCA = re.compile(r"\b(cort[ao]\s+eso|c[oó]rtalo|b[oó]rra\w{0,3}\s+eso)\b", re.I)
 RE_MARCA_DUDOSA = re.compile(r"\bpor\s+eso\b", re.I)
-RE_FILLER = re.compile(r"^(m+h*m+|a+m+|e+h+|a+h+|u+h+)[.,]?$", re.I)
+# Whisper suele escribir la muletilla con puntos suspensivos ("Mmm...", "Mmm…"): con solo [.,]? se colaba al corte
+# (largo de IA sin censura, 2026-11-18)
+RE_FILLER = re.compile(r"^(m+h*m+|a+m+|e+h+|a+h+|u+h+)[.,…]*$", re.I)
 
 SEV_ORDER = {"ERROR": 0, "WARN": 1, "INFO": 2}
 
